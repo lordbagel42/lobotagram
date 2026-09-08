@@ -101,9 +101,22 @@ Entry-point tracking, all name- and string-anchored:
   parameters, the enum at parameter #17, register **v22**. Every path that
   opens a reel builds that config, which makes it the ideal single hook.
   `ReelContext.onViewerSource(Ljava/lang/Enum;)V` goes in at index 0.
-- Sites are sorted lexicographically and capped at 10, so a future build that
-  threads the enum through many clips methods gets a deterministic, bounded set
-  rather than dozens of injections. No site at all is a `PatchException`.
+- Sites are **ranked** before being capped at 10, so a future build that
+  threads the enum through many clips methods gets a deterministic, bounded and
+  *meaningful* set rather than whichever dozen sort first alphabetically. The
+  tiers, best first:
+
+  1. a `<init>` on a class under `Lcom/instagram/clips/intf/` — the viewer
+     config, which every reel-opening path builds,
+  2. any other method under `Lcom/instagram/clips/`,
+  3. a method under `Linstagram/features/clips/viewer/`,
+  4. anything else a widened `CLIPS_PACKAGES` brings in.
+
+  Within a tier the order is defining class, then descriptor. The cap is
+  applied to the ranked list, so the config constructor can never be the
+  candidate that gets dropped, and the line printed when the cap bites says how
+  many candidates were dropped and names them. No site at all is a
+  `PatchException`.
 - The scan lives in `locateClipsAnchors()`, which the "Lobotagram diagnostics"
   patch calls to print the enum, the sites and the autoscroll gate without
   modifying anything. `locateTabBarHooks()` does the same for the tab bar.
@@ -114,7 +127,13 @@ Autoscroll (best effort, never fatal):
   minification and holds one class,
   `ClipsSessionAutoscrollManager$lifecycleCallbacks$1`. Its constructor's
   parameter is the manager itself (`LX/3OV;` here), which carries the
-  "autoscroll is on" boolean.
+  "autoscroll is on" boolean. The candidate set is narrowed before use:
+  framework, JDK and Kotlin types (`Landroid/`, `Ljava/`, `Lkotlin/`,
+  `Lkotlinx/`) and `Lcom/instagram/common/session/UserSession;` — which nearly
+  every Instagram constructor takes — are dropped, and of what remains the
+  types that actually declare a boolean field are preferred, since the flag the
+  gate reads is one of those. Only if that leaves nothing does it fall back to
+  the unfiltered set.
 - The gate is then the one method returning `Z` with a single
   `Lcom/instagram/common/session/UserSession;` parameter that reads a boolean
   field off that manager: `LX/403;->A01(UserSession)Z` in this build, read
@@ -124,7 +143,8 @@ Autoscroll (best effort, never fatal):
   `MutableMethodImplementation` that keeps the register count), rather than
   having a return prepended: a prepended return would leave the old try/catch
   ranges pointing at code that can no longer run.
-- If that chain does not resolve uniquely the patch prints why and carries on.
+- If that chain does not resolve uniquely the patch prints why — listing every
+  candidate gate with its full descriptor — and carries on.
   Failing a build over an optional third layer would be the wrong trade: the
   pager lock already stops the viewer moving and the network gate already
   denies the next reel.
@@ -172,18 +192,33 @@ That split is deliberate:
 
 Hiding the tab icon only removes the button; `swipeable_tab_view_pager` keeps
 the page, so Reels would still be one flick of the thumb away. The instant a
-swipe settles on a page whose tab is `GONE`, the skipper re-aims it at the
+swipe settles on a page whose tab is `GONE`, the skipper sends it on to the
 nearest still-visible tab in the direction of travel. Which page is live is
 read from the tab bar's `View.isSelected()` rather than a page index, so
 nothing depends on the pager and the bar agreeing on an order. `creation_tab`
 is treated as unreachable: it opens the camera, not a page.
+
+The re-aim is two halves, and **the destination is only ever reached by
+`performClick()` on the target tab view** — the app's own navigation path:
+
+1. the in-flight swipe is cancelled with `setCurrentItem(page)`, where `page`
+   is what the pager itself reported via `getCurrentItem()` on the first
+   `DRAGGING` frame of that drag;
+2. once the pager is at rest, the destination tab gets a `performClick()`.
+
+No page index is ever derived from a tab index. Tabs and pages need not line up
+— Create has a tab and no page — so handing a tab-bar child index to
+`setCurrentItem` would land on whatever page sits at that offset. Both pager
+calls are optional and guarded: on a build with neither, the swipe is not
+cancelled and the click alone still arrives on the right surface.
 
 Reflection, not subclassing: the pager is an
 `androidx.viewpager2.widget.ViewPager2` whose class name survived minification
 but whose `registerOnPageChangeCallback` did not (it is `A08` here), so its
 page-change callback cannot be subclassed. The skipper listens on the framework
 `ViewTreeObserver.OnScrollChangedListener` and reads the pager through
-`getScrollState()` / `setCurrentItem(int)`, both of which kept their names.
+`getScrollState()`, `getCurrentItem()` and `setCurrentItem(int)`, all of which
+kept their names.
 
 `ViewerLock`
 
@@ -225,12 +260,12 @@ tab" toggle needs no new anchor.
 - **The touch swallower replaces any existing touch listener** on the pager. It
   is only installed when there is no `setUserInputEnabled`, i.e. never on this
   build.
-- **The swipe skipper feeds a tab-bar child index to `setCurrentItem`.** It
-  reasons in tab views rather than page indices everywhere else, but the jump
-  itself assumes the pager and the bar agree on an order. When they do not, the
-  re-aim misses and `verify()` falls back to clicking the destination tab once
-  the pager settles, which always lands on the right surface but looks like two
-  motions instead of one.
+- **The swipe skip reads as two motions, not one.** Because the destination is
+  reached by clicking its tab rather than by extending the swipe with
+  `setCurrentItem(target)`, the correction is a cancel back to where the drag
+  started followed by a jump to the right surface. Retargeting the in-flight
+  animation would look like a single continuous glide, but it would need a page
+  index for the destination, and only the tab is known to be right.
 - **The watchdog pins to the page the viewer opened on**, not to page 0. That
   is right for a chain whose tapped reel is not first, but if a build changes
   page programmatically *after* the lock captured the index, the watchdog would

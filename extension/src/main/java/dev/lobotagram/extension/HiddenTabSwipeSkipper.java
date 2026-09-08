@@ -21,14 +21,29 @@ import java.util.WeakHashMap;
  * of the thumb away, which defeats the point of the build.
  *
  * <p>The instant a swipe is released toward a page whose tab is gone, this
- * listener re-aims that same swipe at the nearest still-visible tab in the
- * direction of travel (falling back to the other direction when there is
- * nothing that way), so swiping only ever cycles through visible tabs.
- * Re-aiming rather than correcting afterwards is what keeps it feeling like one
- * gesture: a ViewPager2 accepts {@code setCurrentItem} while a scroll is in
- * flight and simply retargets the animation, so the hidden page is passed over
- * in a single continuous motion instead of the pager landing on it and then
- * cutting away.
+ * listener sends it on to the nearest still-visible tab in the direction of
+ * travel (falling back to the other direction when there is nothing that way),
+ * so swiping only ever cycles through visible tabs.
+ *
+ * <h3>How the re-aim is done</h3>
+ * In two halves, and the destination is only ever reached through the app's own
+ * navigation path:
+ *
+ * <ol>
+ *   <li>the in-flight swipe is cancelled with {@code setCurrentItem} back to the
+ *       page the pager itself reported at the start of the drag — read from
+ *       {@code getCurrentItem()}, never derived from a tab index;</li>
+ *   <li>the destination tab view gets a {@link View#performClick()}, which is
+ *       exactly what a user tapping that tab would do.</li>
+ * </ol>
+ *
+ * <p>A page index is never computed from a tab index, because the two need not
+ * line up: the Create entry opens the camera rather than a page, so tab
+ * <em>n</em> is not page <em>n</em>. Feeding a tab-bar child index to
+ * {@code setCurrentItem} would land on whatever page happens to sit at that
+ * offset. The cost is that the correction reads as two motions rather than one
+ * continuous glide; the benefit is that it always arrives on the intended
+ * surface.
  *
  * <h3>Why it is written this way</h3>
  * The pager is an {@code androidx.viewpager2.widget.ViewPager2}. Its abstract
@@ -36,8 +51,10 @@ import java.util.WeakHashMap;
  * {@code registerOnPageChangeCallback} is renamed to {@code A08}) and so cannot
  * be subclassed, but the plain accessors keep their names. So this listens on
  * the framework {@link ViewTreeObserver.OnScrollChangedListener} — never
- * obfuscated — and reads the pager through {@code getScrollState()} /
- * {@code setCurrentItem(int)} by reflection.
+ * obfuscated — and reads the pager through {@code getScrollState()},
+ * {@code getCurrentItem()} and {@code setCurrentItem(int)} by reflection, each
+ * guarded and each optional: without {@code setCurrentItem} the swipe simply is
+ * not cancelled, and the click still gets there.
  *
  * <p>Which page is showing is <em>not</em> read as an index: the tab bar marks
  * the live tab with {@link View#isSelected()}, and clicking another tab is how
@@ -60,10 +77,12 @@ public final class HiddenTabSwipeSkipper {
     /** Give up waiting for rest after this many polls (~1s). */
     private static final int MAX_SETTLE_POLLS = 25;
 
-    /** Grace period before checking that re-aiming the swipe actually took. */
-    private static final long VERIFY_DELAY_MS = 400;
-
-    /** Pagers already hooked, so a re-install does not stack listeners. */
+    /**
+     * Pagers already hooked, so a re-install does not stack listeners.
+     *
+     * <p>Touched only from the UI thread (layout and scroll callbacks), which
+     * is why it needs no synchronisation.
+     */
     private static final Set<View> INSTALLED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
@@ -147,20 +166,26 @@ public final class HiddenTabSwipeSkipper {
         }
         try {
             Method getScrollState = pager.getClass().getMethod("getScrollState");
-            // Fallback for the jump; absent on an unexpected pager, in which
-            // case clicking the destination tab is the only route.
+            // Both of these only cancel the in-flight swipe. The destination is
+            // always reached by clicking its tab, so an unexpected pager that
+            // has neither still ends up on the right surface.
+            Method getCurrentItem = null;
             Method setCurrentItem = null;
             try {
+                getCurrentItem = pager.getClass().getMethod("getCurrentItem");
                 setCurrentItem = pager.getClass().getMethod("setCurrentItem", int.class);
             } catch (Throwable ignored) {
-                Lobo.d("pager has no setCurrentItem(int); swipe skipper will click tabs instead");
+                getCurrentItem = null;
+                setCurrentItem = null;
+                Lobo.d("pager has no getCurrentItem/setCurrentItem(int); "
+                        + "swipe skipper will only click tabs");
             }
             ViewTreeObserver observer = pager.getViewTreeObserver();
             if (observer == null) {
                 return false;
             }
             observer.addOnScrollChangedListener(
-                    new Skipper(pager, tabBar, getScrollState, setCurrentItem));
+                    new Skipper(pager, tabBar, getScrollState, getCurrentItem, setCurrentItem));
             INSTALLED.add(pager);
             Lobo.d("swipe skipper attached to " + pager.getClass().getName());
             return true;
@@ -174,29 +199,47 @@ public final class HiddenTabSwipeSkipper {
 
     /**
      * Fires on every scroll in the pager's window. When a swipe settles on a
-     * tab that is hidden, jumps to the nearest visible one.
+     * tab that is hidden, sends it on to the nearest visible one.
      */
     private static final class Skipper implements ViewTreeObserver.OnScrollChangedListener {
         private final View pager;
         private final ViewGroup tabBar;
         private final Method getScrollState;
+        private final Method getCurrentItem;
         private final Method setCurrentItem;
 
         /** Index of the last reachable tab we settled on, to infer swipe direction. */
         private int previous = -1;
         /** Set while a jump is in flight, so it is only issued once. */
         private boolean jumping;
+        /**
+         * The page the pager itself reported when the current drag began, or -1
+         * outside a drag. The <em>only</em> page index this class handles, and
+         * it comes from {@code getCurrentItem()} rather than from any tab
+         * index — cancelling a swipe means going back exactly where the pager
+         * was, and nothing else here reasons in pages.
+         */
+        private int dragStartPage = -1;
 
-        Skipper(View pager, ViewGroup tabBar, Method getScrollState, Method setCurrentItem) {
+        Skipper(View pager, ViewGroup tabBar, Method getScrollState, Method getCurrentItem,
+                Method setCurrentItem) {
             this.pager = pager;
             this.tabBar = tabBar;
             this.getScrollState = getScrollState;
+            this.getCurrentItem = getCurrentItem;
             this.setCurrentItem = setCurrentItem;
         }
 
         @Override
         public void onScrollChanged() {
             try {
+                int state = scrollState();
+                if (state == STATE_DRAGGING && dragStartPage < 0) {
+                    // First frame of this drag: the pager still reports the
+                    // page it is leaving, which is where a cancel goes back to.
+                    dragStartPage = currentItem();
+                }
+
                 int current = selectedIndex();
                 if (current < 0) {
                     return; // no tab marked live: nothing to reason about
@@ -206,6 +249,9 @@ public final class HiddenTabSwipeSkipper {
                     // On a tab that is really on the bar: remember it, stand down.
                     previous = current;
                     jumping = false;
+                    if (state == STATE_IDLE) {
+                        dragStartPage = -1;
+                    }
                     return;
                 }
 
@@ -214,7 +260,7 @@ public final class HiddenTabSwipeSkipper {
                 }
                 // While the finger is down the page still follows it; re-aiming
                 // now would fight the drag. The release fires another scroll.
-                if (scrollState() == STATE_DRAGGING) {
+                if (state == STATE_DRAGGING) {
                     return;
                 }
 
@@ -236,48 +282,39 @@ public final class HiddenTabSwipeSkipper {
         }
 
         /**
-         * Extend the in-flight swipe to {@code target} instead of letting it
-         * land on the hidden page. Posted rather than called inline so the
-         * pager is not re-entered from inside its own scroll dispatch — one
-         * frame later is still inside the settle animation, which is what makes
-         * the motion continuous.
+         * Send the swipe on to {@code target}: cancel the settle that is
+         * heading for the hidden page, then reach the destination the way the
+         * app itself does, by clicking its tab. A tab index is never handed to
+         * {@code setCurrentItem}, because tabs and pages need not line up.
+         *
+         * <p>Posted rather than called inline so the pager is not re-entered
+         * from inside its own scroll dispatch.
          */
         private void retarget(final int target) {
             pager.post(new Runnable() {
                 @Override
                 public void run() {
-                    if (setCurrentItem == null) {
-                        clickWhenSettled(target, 0);
-                        return;
-                    }
-                    try {
-                        setCurrentItem.invoke(pager, target);
-                    } catch (Throwable t) {
-                        Lobo.d("setCurrentItem failed: " + t);
-                        clickWhenSettled(target, 0);
-                        return;
-                    }
-                    verify(target);
+                    cancelSwipe();
+                    clickWhenSettled(target, 0);
                 }
             });
         }
 
         /**
-         * If re-aiming did not take (a build whose pager ignores it), fall back
-         * to the blunt route: wait for rest, then click the destination tab.
+         * Undo the in-flight swipe by paging back to where the drag started.
+         * Best effort: with no {@code getCurrentItem}/{@code setCurrentItem}, or
+         * no recorded drag, the swipe simply lands and the click corrects it.
          */
-        private void verify(final int target) {
-            pager.postDelayed(new Runnable() {
-                @Override
-                public void run() {
-                    // Landed somewhere reachable in the meantime (here, or
-                    // because the user swiped again): not ours to force.
-                    if (!jumping || selectedIndex() == target) {
-                        return;
-                    }
-                    clickWhenSettled(target, 0);
-                }
-            }, VERIFY_DELAY_MS);
+        private void cancelSwipe() {
+            int page = dragStartPage;
+            if (setCurrentItem == null || page < 0) {
+                return;
+            }
+            try {
+                setCurrentItem.invoke(pager, page);
+            } catch (Throwable t) {
+                Lobo.d("setCurrentItem failed: " + t);
+            }
         }
 
         /**
@@ -359,6 +396,18 @@ public final class HiddenTabSwipeSkipper {
                 return (Integer) getScrollState.invoke(pager);
             } catch (Throwable ignored) {
                 return STATE_IDLE;
+            }
+        }
+
+        /** The pager's own current page, or -1 when it cannot be read. */
+        private int currentItem() {
+            if (getCurrentItem == null) {
+                return -1;
+            }
+            try {
+                return (Integer) getCurrentItem.invoke(pager);
+            } catch (Throwable ignored) {
+                return -1;
             }
         }
     }

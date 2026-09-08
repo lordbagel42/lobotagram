@@ -74,15 +74,23 @@ public final class ReelContext {
         return source.contains("direct");
     }
 
-    /** Called by {@link ViewerLock} when the viewer appears or disappears. */
+    /**
+     * Called by {@link ViewerLock} when the viewer appears or disappears. Runs
+     * off a layout callback inside Instagram, so like the bytecode hook above
+     * it must never throw.
+     */
     public static void onViewerVisible(boolean visible) {
-        if (visible == viewerVisible) {
-            return;
+        try {
+            if (visible == viewerVisible) {
+                return;
+            }
+            viewerVisible = visible;
+            viewerVisibleAtMs = System.currentTimeMillis();
+            Lobo.d("reel viewer " + (visible ? "shown" : "gone")
+                    + " (source=" + source + ", direct=" + isDirect() + ")");
+        } catch (Throwable t) {
+            Lobo.d("ReelContext.onViewerVisible failed: " + t);
         }
-        viewerVisible = visible;
-        viewerVisibleAtMs = System.currentTimeMillis();
-        Lobo.d("reel viewer " + (visible ? "shown" : "gone")
-                + " (source=" + source + ", direct=" + isDirect() + ")");
     }
 
     /** Whether the Reels viewer is on screen right now. */

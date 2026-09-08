@@ -46,7 +46,11 @@ public final class Hiders {
     /** The tab strip inside that header. A generic id, hence the scoping above. */
     private static final String ACTION_BAR_TAB_LAYOUT = "action_bar_tab_layout";
 
-    /** Roots already hooked, so repeated installs do not stack listeners. */
+    /**
+     * Roots already hooked, so repeated installs do not stack listeners.
+     *
+     * <p>Touched only from the UI thread (layout callbacks), hence unsynchronised.
+     */
     private static final Set<View> INSTALLED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 

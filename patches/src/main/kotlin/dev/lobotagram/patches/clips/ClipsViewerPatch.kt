@@ -39,8 +39,32 @@ private val SOURCE_ENUM_STRINGS = listOf("clips_tab", "direct")
  */
 private val CLIPS_PACKAGES = listOf("Lcom/instagram/clips/", "Linstagram/features/clips/")
 
+/**
+ * Package holding the clips-viewer *interfaces* — the viewer config and the
+ * source enum itself. A constructor here is the single point every path that
+ * opens a reel goes through, so it outranks every other candidate.
+ */
+private const val CLIPS_INTF_PACKAGE = "Lcom/instagram/clips/intf/"
+
+/** The app-side clips package: the second-best place to record an entry point. */
+private const val CLIPS_PACKAGE = "Lcom/instagram/clips/"
+
+/** The viewer feature package, ranked last of the three named tiers. */
+private const val CLIPS_VIEWER_PACKAGE = "Linstagram/features/clips/viewer/"
+
 /** Package of the Reels autoscroll controller. Non-obfuscated. */
 private const val AUTOSCROLL_PACKAGE = "Linstagram/features/clips/viewer/controller/autoscroll/"
+
+/**
+ * Types the autoscroll manager can never be: the framework, the JDK, the
+ * Kotlin runtime, and the logged-in session, which every Instagram
+ * constructor takes. Excluding them is what leaves the obfuscated manager.
+ */
+private val NON_MANAGER_TYPE_PREFIXES = listOf("Landroid/", "Ljava/", "Lkotlin/", "Lkotlinx/")
+
+/** Whether a descriptor is a framework/JDK/Kotlin type or the user session. */
+private fun String.isNonManagerType() =
+    this == USER_SESSION || NON_MANAGER_TYPE_PREFIXES.any { startsWith(it) }
 
 /**
  * Upper bound on entry-point hooks. One is expected (the viewer config's
@@ -53,11 +77,36 @@ private const val LOG = "[lobotagram]"
 
 /** A method to hook, and which of its parameters is the source enum. */
 internal class EntryPoint(val method: Method, val parameterIndex: Int) {
+    /** Name and parameters, without the defining class: the sort's tie-breaker. */
+    val descriptor = "${method.name}(${method.parameterTypes.joinToString(",")})${method.returnType}"
+
     val signature =
         "${method.definingClass}->${method.name}(${method.parameterTypes.joinToString(",")})"
 
+    /**
+     * Which tier this candidate belongs to; lower is hooked first. The tiers
+     * exist so that a future build threading the source enum through many
+     * clips methods still hooks the one place every reel-opening path goes
+     * through, instead of whatever happens to sort first alphabetically:
+     *
+     * 0. a constructor under [CLIPS_INTF_PACKAGE] — the viewer config,
+     * 1. any other method under [CLIPS_PACKAGE],
+     * 2. a method under [CLIPS_VIEWER_PACKAGE],
+     * 3. anything else a widened [CLIPS_PACKAGES] brings in.
+     */
+    val tier = when {
+        method.name == "<init>" && method.definingClass.startsWith(CLIPS_INTF_PACKAGE) -> 0
+        method.definingClass.startsWith(CLIPS_PACKAGE) -> 1
+        method.definingClass.startsWith(CLIPS_VIEWER_PACKAGE) -> 2
+        else -> 3
+    }
+
     override fun toString() = "$signature [parameter #$parameterIndex]"
 }
+
+/** Tier first, then defining class, then descriptor: stable across builds. */
+private val ENTRY_POINT_ORDER =
+    compareBy<EntryPoint>({ it.tier }, { it.method.definingClass }, { it.descriptor })
 
 /** Number of registers a method's parameters (plus `this`) occupy. */
 private fun Method.inputRegisters(): Int {
@@ -106,7 +155,7 @@ internal class ClipsAnchor(
     val enumsMentioningClipsTab: List<String>,
     /** The clips-viewer source enum, or null when it was not unique. */
     val sourceEnum: String?,
-    /** Clips-package methods that take that enum, sorted and unbounded. */
+    /** Clips-package methods that take that enum, ranked and unbounded. */
     val entryPoints: List<EntryPoint>,
     /** Candidate autoscroll gates; exactly one is expected. */
     val autoscrollGates: List<Method>,
@@ -144,16 +193,27 @@ internal fun BytecodePatchContext.locateClipsAnchors(): ClipsAnchor {
                     if (index < 0) null else EntryPoint(method, index)
                 }
             }
-            // Deterministic order, so the same APK always gets the same hooks.
-            .sortedBy { it.signature }
+            // Deterministic and meaningful order, so the cap below keeps the
+            // hook that matters rather than the alphabetically luckiest one.
+            .sortedWith(ENTRY_POINT_ORDER)
     }
 
     val autoscrollClasses = classes.filter { it.type.startsWith(AUTOSCROLL_PACKAGE) }
     // The manager type is what the lifecycle callbacks are constructed with.
-    val autoscrollManagerTypes = autoscrollClasses.flatMap { classDef ->
+    // Everything the framework, the JDK, Kotlin or the session contributes is
+    // dropped first; of what is left, a type that actually declares a boolean
+    // field is preferred, because the flag the gate reads is one of those.
+    val autoscrollConstructorTypes = autoscrollClasses.flatMap { classDef ->
         classDef.methods.filter { it.name == "<init>" }
             .flatMap { it.parameterTypes.map(CharSequence::toString) }
-    }.toSet() + autoscrollClasses.map { it.type }
+    }.filterNot { it.isNonManagerType() }.toSet()
+    val withBooleanField = classes
+        .filter { it.type in autoscrollConstructorTypes }
+        .filter { classDef -> classDef.fields.any { it.type == "Z" } }
+        .map { it.type }
+        .toSet()
+    val autoscrollManagerTypes =
+        withBooleanField.ifEmpty { autoscrollConstructorTypes } + autoscrollClasses.map { it.type }
 
     val autoscrollGates = if (autoscrollClasses.isEmpty()) {
         emptyList()
@@ -246,11 +306,16 @@ val clipsViewerPatch = bytecodePatch(
             )
         }
 
+        // The cap applies to the *ranked* list, so the constructor of the
+        // viewer config is never the candidate that gets dropped.
         val hooks = entryPoints.take(MAX_ENTRY_POINT_HOOKS)
-        if (entryPoints.size > MAX_ENTRY_POINT_HOOKS) {
+        val dropped = entryPoints.size - hooks.size
+        if (dropped > 0) {
             println(
-                "$LOG ${entryPoints.size} clips methods take $sourceEnum; hooking the first " +
-                    "$MAX_ENTRY_POINT_HOOKS in lexicographic order",
+                "$LOG ${entryPoints.size} clips methods take $sourceEnum; hooking the " +
+                    "$MAX_ENTRY_POINT_HOOKS highest-ranked and dropping $dropped: " +
+                    entryPoints.drop(MAX_ENTRY_POINT_HOOKS)
+                        .joinToString { "${it.method.definingClass}->${it.descriptor}" },
             )
         }
 
@@ -286,7 +351,9 @@ val clipsViewerPatch = bytecodePatch(
  * (`instagram.features.clips.viewer.controller.autoscroll`) survives
  * minification and holds one class, the session manager's activity-lifecycle
  * callback. That callback's constructor takes the manager itself, which is the
- * obfuscated type carrying the "autoscroll is on" flag. The gate is then the
+ * obfuscated type carrying the "autoscroll is on" flag — found by dropping the
+ * framework, JDK, Kotlin and `UserSession` parameters and keeping the types
+ * that declare a boolean field. The gate is then the
  * one method that reads that flag, takes a `UserSession` and returns a boolean
  * — in 435.0.0.37.76 it is read right next to `MediaOption$Option.AUTO_SCROLL`
  * when the viewer's overflow menu is built.
@@ -310,7 +377,10 @@ private fun BytecodePatchContext.neutralizeAutoscroll(anchor: ClipsAnchor) {
             "$LOG expected exactly one ($USER_SESSION)Z method reading the autoscroll flag on " +
                 "${anchor.autoscrollManagerTypes.joinToString()}, found " +
                 "${anchor.autoscrollGates.size}: " +
-                anchor.autoscrollGates.joinToString { "${it.definingClass}->${it.name}" } +
+                anchor.autoscrollGates.joinToString {
+                    "${it.definingClass}->${it.name}" +
+                        "(${it.parameterTypes.joinToString(",")})${it.returnType}"
+                } +
                 ". Skipping the autoscroll gate; the pager lock still stops the viewer advancing.",
         )
         return

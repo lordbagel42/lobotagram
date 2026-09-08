@@ -71,6 +71,8 @@ public final class ViewerLock {
      * — and with it the pager, its window and its Activity — for the life of
      * the process, which is the classic way to leak an Activity out of a
      * {@link WeakHashMap}.
+     *
+     * <p>Touched only from the UI thread (layout callbacks), hence unsynchronised.
      */
     private static final Map<View, Lock> LOCKS = new WeakHashMap<View, Lock>();
 
