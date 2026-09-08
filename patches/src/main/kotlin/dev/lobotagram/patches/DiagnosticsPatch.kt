@@ -3,6 +3,7 @@ package dev.lobotagram.patches
 import app.revanced.patcher.firstImmutableClassDefOrNull
 import app.revanced.patcher.patch.PatchException
 import app.revanced.patcher.patch.bytecodePatch
+import dev.lobotagram.patches.clips.locateClipsAnchors
 import dev.lobotagram.patches.feed.CLIPS_NETEGO
 import dev.lobotagram.patches.feed.FEED_UNIT_COMPANIONS
 import dev.lobotagram.patches.feed.PARSE_FROM_JSON
@@ -15,16 +16,34 @@ import dev.lobotagram.patches.shared.EXTENSION_PACKAGE
 import dev.lobotagram.patches.shared.compatibleWithInstagram
 import dev.lobotagram.patches.signature.KEY_HASH_STRING
 import dev.lobotagram.patches.signature.locateSignatureChecks
+import dev.lobotagram.patches.ui.locateTabBarHooks
 
 private const val LOG = "[lobotagram]"
 
-private val EXTENSION_CLASSES = listOf("Lobo", "Gate", "FeedFilter")
+/** Every class the extension DEX must contribute, network side and UI side. */
+private val EXTENSION_CLASSES = listOf(
+    "Lobo",
+    "Gate",
+    "FeedFilter",
+    "Hiders",
+    "HiddenTabSwipeSkipper",
+    "ViewerLock",
+    "ReelContext",
+)
+
+/** How many injection sites to print in full before summarising. */
+private const val MAX_LISTED = 5
 
 /**
- * Reconnaissance for every anchor the network-side patches rely on. Changes
- * nothing in the APK: it resolves each anchor and prints what it resolved to, so
- * on a new Instagram release one run tells you which anchor drifted and what it
- * drifted to.
+ * Reconnaissance for every anchor the patches rely on, network side and UI side.
+ * Changes nothing in the APK: it resolves each anchor and prints what it
+ * resolved to, so on a new Instagram release one run tells you which anchor
+ * drifted and what it drifted to.
+ *
+ * The locate functions are the *same* ones the real patches call
+ * ([locateStartRequest], [locateSignatureChecks], [locateFeedItemParsers],
+ * [locateTabBarHooks], [locateClipsAnchors]), so this can never report an
+ * anchor the patches would resolve differently.
  *
  * Disabled by default; enable it by name:
  * `-e "Lobotagram diagnostics"`.
@@ -33,8 +52,9 @@ private val EXTENSION_CLASSES = listOf("Lobo", "Gate", "FeedFilter")
 val diagnosticsPatch = bytecodePatch(
     name = "Lobotagram diagnostics",
     description = "Prints what every lobotagram anchor resolved to — the Tigon request method and " +
-        "its URI field, the signature-check methods, the feed-item deserialisers — and confirms " +
-        "the extension DEX was merged. Modifies nothing.",
+        "its URI field, the signature-check methods, the feed-item deserialisers, the tab-bar " +
+        "binder and activity hook, the clips-viewer source enum and its injection sites, the " +
+        "autoscroll gate — and confirms the extension DEX was merged. Modifies nothing.",
     use = false,
 ) {
     compatibleWithInstagram()
@@ -70,11 +90,82 @@ val diagnosticsPatch = bytecodePatch(
                         if (anchor.uriLoadIndex != null) {
                             "primary (inject after the iget-object)"
                         } else if (anchor.uriFieldNames.size == 1) {
-                            "fallback (iget-object from p1 at method entry)"
+                            "fallback (iget-object from the request parameter at method entry)"
                         } else {
                             "none — the patch would fail"
                         },
                 )
+            }
+
+        println("$LOG === P2 tab bar ===")
+        runCatching { locateTabBarHooks() }
+            .onFailure { failures += "P2: ${it.message}" }
+            .onSuccess { anchor ->
+                println(
+                    "$LOG binder candidates:      ${anchor.withSessionAccessor.size} discriminated, " +
+                        "${anchor.viewGroupFromLookup.size} lookup-fed, " +
+                        "${anchor.structural.size} structural",
+                )
+                anchor.structural.take(MAX_LISTED).forEach { println("$LOG   candidate: $it") }
+                if (anchor.structural.size > MAX_LISTED) {
+                    println("$LOG   ... and ${anchor.structural.size - MAX_LISTED} more")
+                }
+                println("$LOG binder chosen:          ${anchor.binder ?: "none — ambiguous"}")
+                println("$LOG activity hook:          ${anchor.activityHookDescriptor ?: "none"}")
+
+                // Either hook alone still hides the tab; only losing both is fatal.
+                if (anchor.binder == null && anchor.activityHook == null) {
+                    failures += "P2: neither the tab-bar binder nor an activity hook resolved"
+                } else if (anchor.activityHook == null) {
+                    failures += "P2: no activity hook resolved, so the Reels viewer lock will not " +
+                        "run in windows that have no tab bar (ModalActivity, URL handlers)"
+                }
+            }
+
+        println("$LOG === P3 clips viewer lock ===")
+        runCatching { locateClipsAnchors() }
+            .onFailure { failures += "P3: ${it.message}" }
+            .onSuccess { anchor ->
+                println(
+                    "$LOG source enum:            " +
+                        (anchor.sourceEnum ?: "not unique (${anchor.sourceEnums.size} matched: " +
+                            "${anchor.sourceEnums.joinToString()})"),
+                )
+                println("$LOG enums holding clips_tab: ${anchor.enumsMentioningClipsTab.joinToString()}")
+                println("$LOG injection sites:        ${anchor.entryPoints.size}")
+                anchor.entryPoints.take(MAX_LISTED).forEach { entryPoint ->
+                    println(
+                        "$LOG   ${entryPoint.method.definingClass}->${entryPoint.method.name}" +
+                            " (${entryPoint.method.parameterTypes.size} parameters, enum at " +
+                            "#${entryPoint.parameterIndex})",
+                    )
+                }
+                if (anchor.entryPoints.size > MAX_LISTED) {
+                    println("$LOG   ... and ${anchor.entryPoints.size - MAX_LISTED} more")
+                }
+                println(
+                    "$LOG autoscroll manager types: " +
+                        anchor.autoscrollManagerTypes.ifEmpty { setOf("none") }.joinToString(),
+                )
+                println(
+                    "$LOG autoscroll gate:        " +
+                        when (anchor.autoscrollGates.size) {
+                            0 -> "none — the gate would be skipped (not fatal)"
+                            1 -> anchor.autoscrollGates.single()
+                                .let { "${it.definingClass}->${it.name}" }
+
+                            else -> "ambiguous (${anchor.autoscrollGates.size}: " +
+                                anchor.autoscrollGates.joinToString {
+                                    "${it.definingClass}->${it.name}"
+                                } + ") — the gate would be skipped (not fatal)"
+                        },
+                )
+
+                if (anchor.sourceEnum == null) {
+                    failures += "P3: the clips-viewer source enum is not unique"
+                } else if (anchor.entryPoints.isEmpty()) {
+                    failures += "P3: no clips-package method takes the source enum"
+                }
             }
 
         println("$LOG === P4 signature bypass ===")

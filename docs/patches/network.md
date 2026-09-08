@@ -36,7 +36,7 @@ and nothing crashes.
 off the first parameter at method entry instead:
 
 ```
-move-object/from16 v0, p1
+move-object/from16 v0, p1        # p0 if startRequest ever becomes static
 iget-object v0, v0, <requestType>-><uriField>:Ljava/net/URI;
 invoke-static/range {v0}, Gate;->throwIfBlocked(Ljava/net/URI;)V
 ```
@@ -51,22 +51,61 @@ becomes the live strategy, re-point the primary one instead.
 **Extension entry point.** `Gate.throwIfBlocked(URI)`. The rules are `String[]`
 tables at the top of `Gate.java`, applied in this order:
 
-1. **Allow** `/api/v1/direct_v2/` (prefix), Stories (`/feed/reels_tray`,
-   `/feed/get_latest_reel_media/`, `/stories/`) and anything that looks like
-   creation (`upload`, `configure`, `/media/configure_to_clips/`).
-2. **Block** the Reels surfaces: `/clips/home/`, `/clips/discover`,
-   `/clips/homecoming`, `/clips/trend`, `/mixed_media/discover/stream/`,
-   `/clips/get_blend_medias/`, `/clips/ads_discover_sync_flow/`,
-   `/feed/injected_reels_media`, `/clips/music/`, `/clips/audio/`,
-   `/clips/effect/`, `/clips/hashtag/`, `/clips/location/`.
-3. **Block** any other `/api/v1/clips/` request whose query carries a pagination
-   cursor (`max_id=`, `next_media_ids=`, `page_index=`, `paging_token=`). This is
-   the rule that lets one DM-shared reel play and starves the next one.
-4. **Block**, if the options are on: `/discover/topical_explore` (Explore) and
+1. **Allow** `/api/v1/direct_v2/` (prefix) and Stories (`/feed/reels_tray`,
+   `/feed/get_latest_reel_media/`, `/stories/`).
+2. **Block** the Reels surfaces: `/clips/connected/`, `/clips/home/`,
+   `/clips/discover`, `/clips/homecoming`, `/clips/trend`,
+   `/mixed_media/discover/stream/`, `/clips/get_blend_medias/`,
+   `/clips/ads_discover_sync_flow/`, `/feed/injected_reels_media`,
+   `/clips/music/`, `/clips/audio`, `/clips/effect/`, `/clips/keyword/`,
+   `/clips/tags/`, `/clips/locations/`.
+3. **Allow** anything that looks like creation (`upload`, `configure`,
+   `/media/configure_to_clips/`). *After* the Reels block, not before: those
+   tokens are bare substrings, and a Reels feed that happened to carry
+   `upload` or `configure` anywhere in its path would otherwise be allowed
+   through by accident. Nothing under `/api/v1/clips/` in this release contains
+   either token, so the ordering costs nothing and closes the hole.
+4. **Block** any other request with `/clips/` as a path segment whose query
+   carries a pagination cursor (`max_id=`, `next_media_ids=`, `page_index=`,
+   `paging_token=`, `chaining_media_id=`). Both `getRawQuery()` and
+   `getQuery()` are checked, so a percent-encoded parameter name is still
+   caught; `getRawQuery()` is tried first because `getQuery()` is the one that
+   decodes and therefore the one that can throw. This is the rule that lets one
+   DM-shared reel play and starves the next one.
+5. **Block**, if the options are on: `/discover/topical_explore` (Explore) and
    `/qp/batch_fetch/` (nudges).
+
+Everything except the `throw` runs inside a `catch (Throwable)` that fails
+*open*. The gate sits on the request path of an app that is not ours: the only
+exception allowed to leave it is the `IOException` the caller already handles.
 
 Inside Instagram "reel" means Story and "clips" means Reel, which is why
 `/feed/reels_tray/` is on the allow-list.
+
+**Why `/clips/connected/` is blocked outright.** It is the chaining feed —
+`LX/30k;->A04` builds it with `chaining_media_id`, `cn_media_limit` and an
+*optional* `max_id`, i.e. "the reels that come after this one". Its first page
+carries no cursor, so the pagination rule in step 4 would let it through and
+hand the DM-opened viewer a list of reels to scroll. The reel a friend shared
+arrives from `/api/v1/media/<id>/info/` and the DM thread payload, never from
+here, so blocking it cannot break playback.
+
+The endpoint names above were checked against the strings in the pinned APK.
+Four notes for the next release:
+
+- `/clips/home/` and `/mixed_media/discover/stream/` no longer appear in
+  435.0.0.37.76 at all; the Reels tab feed is served under `/clips/discover/*`
+  now. They are kept because they cost nothing and Meta reuses names.
+- `/clips/tags/` and `/clips/locations/` are the real endpoint names. The
+  earlier `/clips/hashtag/` and `/clips/location/` matched nothing — the second
+  one silently, because the trailing slash made `/clips/location/` fail against
+  `/clips/locations/1234/`.
+- `/clips/audio` has no trailing slash so it also covers
+  `/clips/audio_page_chain_clips/`, the "more reels with this sound" chain.
+- `/clips/direct_thread_clips/` is deliberately *not* on the block list: it may
+  be how the viewer opened from a DM thread loads its own item. Its first page
+  is allowed and its pagination is blocked by step 4, which is exactly the
+  wanted behaviour.
 
 **Options.** `blockExplore` and `blockNudges`, both Boolean, both default true.
 
@@ -162,9 +201,14 @@ java -Xmx6g -jar tools/revanced-cli-6.0.0-all.jar patch -b \
     -o /tmp/out.apk --purge -t /tmp/patch-tmp instagram-435.0.0.37.76.apk
 ```
 
-Output on the pinned release:
+It reports the UI anchors too — see `docs/patches/ui.md` — by calling the same
+`locate*` functions the real patches call, so it can never report an anchor the
+patches would resolve differently. Output on the pinned release, abridged:
 
 ```
+[lobotagram] === extension ===
+[lobotagram] Ldev/lobotagram/extension/Lobo; merged: true
+[lobotagram] ... one line per extension class, network side and UI side
 [lobotagram] === P1 network gate ===
 [lobotagram] class:                  Lcom/instagram/api/tigon/TigonServiceLayer;
 [lobotagram] method:                 startRequest
@@ -173,6 +217,15 @@ Output on the pinned release:
 [lobotagram] first iget-object of Ljava/net/URI; at index: 25
 [lobotagram] request type:           LX/4qo;
 [lobotagram]   Ljava/net/URI; fields:  A08
+[lobotagram] === P2 tab bar ===
+[lobotagram] binder candidates:      1 discriminated, 8 lookup-fed, 8 structural
+[lobotagram] binder chosen:          LX/0ne;-><init>(Landroid/view/View;) [iput-object #7, v0]
+[lobotagram] activity hook:          Lcom/instagram/base/activity/BaseFragmentActivity;->onAttachedToWindow()V
+[lobotagram] === P3 clips viewer lock ===
+[lobotagram] source enum:            Lcom/instagram/clips/intf/ClipsViewerSource;
+[lobotagram] injection sites:        1
+[lobotagram]   Lcom/instagram/clips/intf/ClipsViewerConfig;-><init> (223 parameters, enum at #17)
+[lobotagram] autoscroll gate:        LX/403;->A01
 [lobotagram] === P4 signature bypass ===
 [lobotagram] key-hash type:          LX/6ls;
 [lobotagram] (KeyHash)Z:             LX/4Fz;->A01
@@ -180,6 +233,8 @@ Output on the pinned release:
 [lobotagram] === P5 feed item filter ===
 [lobotagram]   LX/5mk;->unsafeParseFromJson(LX/2q3;)
 [lobotagram]     hook: token in v14, move-result-object at index 74, ...
+[lobotagram] === summary ===
+[lobotagram] anchors that failed:    0
 ```
 
 ## Reading the trace log
@@ -196,8 +251,8 @@ Every request through the gate is logged as one of
 
 ```
 ALLOW /api/v1/direct_v2/inbox/?persistentBadging=true...
-BLOCK reels-surface /clips/home/ /api/v1/clips/home/
-BLOCK clips-pagination max_id= /api/v1/clips/connected/
+BLOCK reels-surface /clips/connected/ /api/v1/clips/connected/
+BLOCK clips-pagination max_id= /api/v1/clips/user/
 BLOCK explore /api/v1/discover/topical_explore/
 ```
 

@@ -10,6 +10,8 @@ import android.view.Window;
 import android.widget.HorizontalScrollView;
 
 import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
 import java.util.Set;
 import java.util.WeakHashMap;
 
@@ -21,8 +23,8 @@ import java.util.WeakHashMap;
  * SharedPreferences toggles: lobotagram v1 has no settings, so every hider is
  * hardcoded on.
  *
- * <p>Everything is driven from one {@link ViewTreeObserver.OnGlobalLayoutListener}
- * on the tab bar (or, in the fallback wiring, the activity's decor view). A
+ * <p>Everything is driven from {@link ViewTreeObserver.OnGlobalLayoutListener}s:
+ * one on the tab bar, one on each activity window's decor view. A
  * layout listener rather than a one-shot pass because Instagram rebuilds and
  * re-shows these views constantly: the Reels tab is re-created when the bar is
  * re-bound, and the Reels viewer's header is inflated long after the tab bar
@@ -48,6 +50,18 @@ public final class Hiders {
     private static final Set<View> INSTALLED =
             Collections.newSetFromMap(new WeakHashMap<View, Boolean>());
 
+    /**
+     * Resource name to id, resolved once per process.
+     *
+     * <p>{@link Resources#getIdentifier} is a name lookup in the resource
+     * table, and every hider asks for two to five ids on <em>every layout
+     * pass</em> of every window this is installed on. Ids do not change while
+     * the process lives, so they are cached; a miss (0) is cached too, so a
+     * build without {@code clips_tab} does not re-scan the table forever.
+     * Reads and writes only happen on the UI thread (layout callbacks).
+     */
+    private static final Map<String, Integer> IDS = new HashMap<String, Integer>();
+
     private Hiders() {
     }
 
@@ -60,10 +74,18 @@ public final class Hiders {
     }
 
     /**
-     * Fallback wiring: called from {@code InstagramMainActivity} when the
-     * tab-bar binder could not be fingerprinted. The decor view is a superset
-     * of the tab bar's window, and every hider searches the window anyway, so
-     * the two entry points behave identically.
+     * Window wiring: called from a framework override on Instagram's activity
+     * base class, for every activity that can host a fragment.
+     *
+     * <p>Not merely a fallback for {@link #install(ViewGroup)}. A
+     * {@link ViewTreeObserver} only ever fires for its own window, and the
+     * Reels viewer opens in {@code ModalActivity} or a URL-handler activity as
+     * often as in the main one — where the tab bar, and therefore the observer
+     * installed on it, does not exist. Without this entry point
+     * {@link ViewerLock} and the Friends-lane hider would never see those
+     * viewers. The decor view is a superset of the tab bar's window and every
+     * hider searches the window anyway, so when both hooks fire in the same
+     * window the second one is a no-op ({@link #INSTALLED} is keyed by root).
      */
     public static void install(Activity activity) {
         try {
@@ -110,14 +132,19 @@ public final class Hiders {
      */
     static int resolveId(Context context, String name) {
         try {
+            Integer cached = IDS.get(name);
+            if (cached != null) {
+                return cached.intValue();
+            }
             Resources resources = context.getResources();
             if (resources == null) {
-                return 0;
+                return 0; // not cached: a context with no resources is transient
             }
             int id = resources.getIdentifier(name, "id", context.getPackageName());
             if (id == 0) {
                 id = resources.getIdentifier(name, "id", FALLBACK_PACKAGE);
             }
+            IDS.put(name, Integer.valueOf(id));
             return id;
         } catch (Throwable t) {
             return 0;

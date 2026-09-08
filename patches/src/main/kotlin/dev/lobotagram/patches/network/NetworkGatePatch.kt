@@ -60,11 +60,16 @@ internal class StartRequestAnchor(
     val uriRegister: Int?,
     /** The type of the first parameter: Instagram's request object. */
     val requestType: String,
+    /** True when the method is static, i.e. its first parameter is `p0`. */
+    val isStatic: Boolean,
     /** Every [URI_TYPE] field declared on [requestType]. Exactly one is expected. */
     val uriFieldNames: List<String>,
 ) {
     val definingClass get() = method.definingClass
     val methodName get() = method.name
+
+    /** Smali name of the register holding the request object at method entry. */
+    val requestParameter get() = if (isStatic) "p0" else "p1"
 }
 
 /** Registers taken by `this` plus the parameters; every lower register is scratch. */
@@ -129,6 +134,7 @@ internal fun BytecodePatchContext.locateStartRequest(): StartRequestAnchor {
         uriLoadIndex = uriLoad?.index,
         uriRegister = (uriLoad?.value as? OneRegisterInstruction)?.registerA,
         requestType = requestType,
+        isStatic = AccessFlags.STATIC.isSet(method.accessFlags),
         uriFieldNames = uriFieldNames,
     )
 }
@@ -188,10 +194,10 @@ val networkGatePatch = bytecodePatch(
  * `IOException` try block, so the throw is caught by Instagram.
  *
  * Strategy 2 (fallback, if that `iget-object` is gone): read the URI field off
- * the first parameter at method entry. `move-object/from16` first, so the
- * injection works no matter how high the parameter registers sit, then
- * `iget-object` into scratch register 0, which no instruction has defined yet at
- * method entry.
+ * the first parameter at method entry (`p1` on an instance method, `p0` on a
+ * static one). `move-object/from16` first, so the injection works no matter how
+ * high the parameter registers sit, then `iget-object` into scratch register 0,
+ * which no instruction has defined yet at method entry.
  */
 private fun injectGate(
     method: MutableMethod,
@@ -240,7 +246,7 @@ private fun injectGate(
     method.addInstructions(
         0,
         """
-            move-object/from16 v0, p1
+            move-object/from16 v0, ${anchor.requestParameter}
             iget-object v0, v0, ${anchor.requestType}->$fieldName:$URI_TYPE
             invoke-static/range { v0 .. v0 }, $GATE_CLASS->$THROW_IF_BLOCKED
         """.trimIndent(),

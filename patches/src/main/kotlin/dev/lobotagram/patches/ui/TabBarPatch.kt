@@ -6,6 +6,7 @@ import app.revanced.patcher.extensions.instructionsOrNull
 import app.revanced.patcher.extensions.methodReference
 import app.revanced.patcher.firstImmutableClassDefOrNull
 import app.revanced.patcher.firstMethodOrNull
+import app.revanced.patcher.patch.BytecodePatchContext
 import app.revanced.patcher.patch.PatchException
 import app.revanced.patcher.patch.bytecodePatch
 import com.android.tools.smali.dexlib2.AccessFlags
@@ -29,9 +30,23 @@ private const val ACTIVITY = "Landroid/app/Activity;"
 /** Named, non-obfuscated, and the only thing the tab bar cannot be built without. */
 private const val USER_SESSION = "Lcom/instagram/common/session/UserSession;"
 
-/** Named class. Its own methods are obfuscated; its framework overrides are not. */
-private const val MAIN_ACTIVITY = "Lcom/instagram/mainactivity/InstagramMainActivity;"
-private const val ON_WINDOW_FOCUS_CHANGED = "onWindowFocusChanged"
+/**
+ * Activity-level hooks, most general first. All three are framework method
+ * names on named Instagram classes.
+ *
+ * `BaseFragmentActivity` is the base of `InstagramMainActivity`, of
+ * `ModalActivity` (which hosts most non-tab fragments, the Reels viewer among
+ * them) and of the URL handlers a shared reel deep-links into, so hooking it
+ * once reaches every window that can show a reel. That matters: the runtime
+ * side drives everything off one `ViewTreeObserver`, and a `ViewTreeObserver`
+ * only ever fires for its own window — a listener installed on the tab bar
+ * cannot see the Reels viewer if the viewer opened in a different activity.
+ */
+private val ACTIVITY_HOOKS = listOf(
+    "Lcom/instagram/base/activity/BaseFragmentActivity;" to ("onAttachedToWindow" to emptyList<String>()),
+    "Lcom/instagram/base/activity/IgFragmentActivity;" to ("onWindowFocusChanged" to listOf("Z")),
+    "Lcom/instagram/mainactivity/InstagramMainActivity;" to ("onWindowFocusChanged" to listOf("Z")),
+)
 
 private const val LOG = "[lobotagram]"
 
@@ -42,12 +57,31 @@ private const val LOG = "[lobotagram]"
  * @param storeIndex index of the `iput-object` that stores the ViewGroup
  * @param register the register holding the ViewGroup at that point
  */
-private class TabBarBinder(
+internal class TabBarBinder(
     val method: Method,
     val storeIndex: Int,
     val register: Int,
 ) {
     override fun toString() = "${method.definingClass}-><init>($VIEW) [iput-object #$storeIndex, v$register]"
+}
+
+/** What [locateTabBarHooks] found, so the diagnostics patch can print it. */
+internal class TabBarAnchor(
+    /** Level 1: every `<init>(View)` with the FeurStagram shape. */
+    val structural: List<TabBarBinder>,
+    /** Level 2: …whose ViewGroup came out of a `View.findViewById`. */
+    val viewGroupFromLookup: List<TabBarBinder>,
+    /** Level 3: …on a class that also builds a ViewGroup from a `UserSession`. */
+    val withSessionAccessor: List<TabBarBinder>,
+    /** The most specific level that identified exactly one candidate, or null. */
+    val binder: TabBarBinder?,
+    /** The activity-level hook, or null if none of [ACTIVITY_HOOKS] resolved. */
+    val activityHook: Method?,
+) {
+    val activityHookDescriptor
+        get() = activityHook?.let {
+            "${it.definingClass}->${it.name}(${it.parameterTypes.joinToString("")})${it.returnType}"
+        }
 }
 
 /** Number of registers a method's parameters (plus `this`) occupy. */
@@ -82,16 +116,102 @@ private fun staticCall(
 )
 
 /**
+ * Resolves both hooks without modifying anything. Shared with the diagnostics
+ * patch, which prints the candidate counts so a drifted shape is visible
+ * without running the real patch.
+ */
+internal fun BytecodePatchContext.locateTabBarHooks(): TabBarAnchor {
+    // Level 1: the FeurStagram shape. Level 2 requires the ViewGroup to have
+    // come out of a findViewById on the constructor's own View, which is what a
+    // tab-bar binder does and what a plain view holder does not. Level 3 adds
+    // the named-type discriminator.
+    val structural = mutableListOf<TabBarBinder>()
+    val viewGroupFromLookup = mutableListOf<TabBarBinder>()
+    val withSessionAccessor = mutableListOf<TabBarBinder>()
+
+    classDefs.toList().forEach { classDef ->
+        val sessionViewGroupAccessor by lazy { classDef.hasSessionToViewGroupMethod() }
+
+        classDef.methods.forEach { method ->
+            if (method.name != "<init>") return@forEach
+            if (method.parameterTypes.size != 1 || method.parameterTypes[0].toString() != VIEW) return@forEach
+
+            val instructions = method.instructionsOrNull?.toList() ?: return@forEach
+
+            var storeIndex = -1
+            var register = -1
+            var storeFollowsLookup = false
+            var storesView = false
+            var sawViewLookup = false
+
+            instructions.forEachIndexed { index, instruction ->
+                val callee = instruction.methodReference
+                if (callee != null && callee.definingClass == VIEW &&
+                    (callee.name == "findViewById" || callee.name == "requireViewById")
+                ) {
+                    sawViewLookup = true
+                }
+
+                if (instruction.opcode != Opcode.IPUT_OBJECT) return@forEachIndexed
+                when (instruction.fieldReference?.type) {
+                    VIEW_GROUP -> if (storeIndex < 0) {
+                        storeIndex = index
+                        register = (instruction as TwoRegisterInstruction).registerA
+                        storeFollowsLookup = sawViewLookup
+                    }
+
+                    VIEW -> storesView = true
+                }
+            }
+
+            if (storeIndex < 0 || !storesView) return@forEach
+
+            val candidate = TabBarBinder(method, storeIndex, register)
+            structural += candidate
+            if (!storeFollowsLookup) return@forEach
+            viewGroupFromLookup += candidate
+            if (sessionViewGroupAccessor) withSessionAccessor += candidate
+        }
+    }
+
+    // Most specific level that identifies exactly one method wins. Anything
+    // ambiguous is not worth guessing at: the activity hook below is slower to
+    // take effect but cannot be wrong.
+    val binder = listOf(withSessionAccessor, viewGroupFromLookup, structural)
+        .firstOrNull { it.size == 1 }
+        ?.single()
+
+    val activityHook = ACTIVITY_HOOKS.firstNotNullOfOrNull { (type, signature) ->
+        val (name, parameters) = signature
+        firstImmutableClassDefOrNull(type)?.methods?.firstOrNull {
+            it.name == name &&
+                it.parameterTypes.map(Any::toString) == parameters &&
+                it.returnType == "V" &&
+                it.implementation != null &&
+                !AccessFlags.STATIC.isSet(it.accessFlags)
+        }
+    }
+
+    return TabBarAnchor(
+        structural = structural,
+        viewGroupFromLookup = viewGroupFromLookup,
+        withSessionAccessor = withSessionAccessor,
+        binder = binder,
+        activityHook = activityHook,
+    )
+}
+
+/**
  * Removes the Reels tab, the page behind it, and the Reels viewer's lateral
  * lane (P2 of `docs/04-patch-plan.md`).
  *
- * The patch itself only installs a hook; all the work happens at runtime in
+ * The patch itself only installs hooks; all the work happens at runtime in
  * `Hiders`, which resolves its targets by resource *name* on every layout pass.
  * That split is deliberate: view ids move between Instagram releases far more
  * often than resource names do, and a hider that re-runs survives Instagram
  * rebuilding the tab bar.
  *
- * Two hooks are tried, in order:
+ * Two hooks, and both are installed when both resolve:
  *
  * 1. The main tab-bar binder's constructor. It takes the tab-bar root `View`,
  *    pulls the `tab_bar` `ViewGroup` out of it with `findViewById` and stashes
@@ -100,11 +220,19 @@ private fun staticCall(
  *    discriminator (the binder class also exposes a
  *    `(UserSession, ...) -> ViewGroup` method) until exactly one method is
  *    left. `Hiders.install(ViewGroup)` is injected right after the store, with
- *    the ViewGroup that was just stored.
- * 2. `InstagramMainActivity.onWindowFocusChanged(boolean)` — a framework
- *    override on a named class, so it cannot be renamed. `Hiders.install(Activity)`
- *    walks the window from the decor view instead. Slower to take effect and
- *    fires repeatedly (the runtime side is idempotent), but name-anchored.
+ *    the ViewGroup that was just stored. This is the hook that hides the Reels
+ *    tab the instant the bar is built.
+ * 2. A framework override on a named activity base class — first choice
+ *    `BaseFragmentActivity.onAttachedToWindow()`. `Hiders.install(Activity)`
+ *    walks that window from its decor view. This one is not only a fallback:
+ *    a `ViewTreeObserver` fires for one window, and the Reels viewer opens in
+ *    `ModalActivity` or a URL-handler activity as often as in the main one, so
+ *    without it `ViewerLock` and the Friends-lane hider would never see the
+ *    viewer at all. `Hiders` is idempotent per root view, so the two hooks
+ *    overlapping in the main activity's window is harmless.
+ *
+ * Only if *neither* resolves does the patch fail, with the candidate count at
+ * each level and every structural candidate's class.
  */
 @Suppress("unused")
 val tabBarPatch = bytecodePatch(
@@ -116,66 +244,9 @@ val tabBarPatch = bytecodePatch(
     extendWith(EXTENSION)
 
     apply {
-        // Level 1: the FeurStagram shape. Level 2 requires the ViewGroup to
-        // have come out of a findViewById on the constructor's own View, which
-        // is what a tab-bar binder does and what a plain view holder does not.
-        // Level 3 adds the named-type discriminator.
-        val structural = mutableListOf<TabBarBinder>()
-        val viewGroupFromLookup = mutableListOf<TabBarBinder>()
-        val withSessionAccessor = mutableListOf<TabBarBinder>()
+        val anchor = locateTabBarHooks()
 
-        classDefs.toList().forEach { classDef ->
-            val sessionViewGroupAccessor by lazy { classDef.hasSessionToViewGroupMethod() }
-
-            classDef.methods.forEach { method ->
-                if (method.name != "<init>") return@forEach
-                if (method.parameterTypes.size != 1 || method.parameterTypes[0].toString() != VIEW) return@forEach
-
-                val instructions = method.instructionsOrNull?.toList() ?: return@forEach
-
-                var storeIndex = -1
-                var register = -1
-                var storeFollowsLookup = false
-                var storesView = false
-                var sawViewLookup = false
-
-                instructions.forEachIndexed { index, instruction ->
-                    val callee = instruction.methodReference
-                    if (callee != null && callee.definingClass == VIEW &&
-                        (callee.name == "findViewById" || callee.name == "requireViewById")
-                    ) {
-                        sawViewLookup = true
-                    }
-
-                    if (instruction.opcode != Opcode.IPUT_OBJECT) return@forEachIndexed
-                    when (instruction.fieldReference?.type) {
-                        VIEW_GROUP -> if (storeIndex < 0) {
-                            storeIndex = index
-                            register = (instruction as TwoRegisterInstruction).registerA
-                            storeFollowsLookup = sawViewLookup
-                        }
-
-                        VIEW -> storesView = true
-                    }
-                }
-
-                if (storeIndex < 0 || !storesView) return@forEach
-
-                val candidate = TabBarBinder(method, storeIndex, register)
-                structural += candidate
-                if (!storeFollowsLookup) return@forEach
-                viewGroupFromLookup += candidate
-                if (sessionViewGroupAccessor) withSessionAccessor += candidate
-            }
-        }
-
-        // Most specific level that identifies exactly one method wins. Anything
-        // ambiguous is not worth guessing at: the named-class fallback below is
-        // slower but cannot be wrong.
-        val binder = listOf(withSessionAccessor, viewGroupFromLookup, structural)
-            .firstOrNull { it.size == 1 }
-            ?.single()
-
+        val binder = anchor.binder
         if (binder != null) {
             val method = firstMethodOrNull(binder.method)
                 ?: throw PatchException(
@@ -190,56 +261,61 @@ val tabBarPatch = bytecodePatch(
 
             println("$LOG tab-bar binder: $binder")
             println("$LOG injected $HIDERS_CLASS->$INSTALL($VIEW_GROUP)V after the tab_bar store")
+        } else {
+            println(
+                "$LOG tab-bar binder not uniquely identified " +
+                    "(${anchor.withSessionAccessor.size} discriminated, " +
+                    "${anchor.viewGroupFromLookup.size} lookup-fed, " +
+                    "${anchor.structural.size} structural); relying on the activity hook alone",
+            )
+        }
+
+        val activityHook = anchor.activityHook
+        if (activityHook == null) {
+            if (binder == null) {
+                throw PatchException(
+                    "Neither hook resolved. The tab-bar binder was ambiguous (" +
+                        "${anchor.withSessionAccessor.size} discriminated, " +
+                        "${anchor.viewGroupFromLookup.size} lookup-fed, " +
+                        "${anchor.structural.size} structural: " +
+                        anchor.structural.joinToString { it.method.definingClass } +
+                        "), and none of " +
+                        ACTIVITY_HOOKS.joinToString { (type, signature) ->
+                            "$type->${signature.first}(${signature.second.joinToString("")})V"
+                        } +
+                        " exists with a body. Re-run the recon in docs/patches/ui.md: find the " +
+                        "class whose <init>($VIEW) stores the tab_bar ViewGroup and add a " +
+                        "discriminator that holds in the new build, or point ACTIVITY_HOOKS at a " +
+                        "framework override that runs after the content view is set.",
+                )
+            }
+
+            println(
+                "$LOG no activity hook resolved (tried " +
+                    ACTIVITY_HOOKS.joinToString { it.first } +
+                    "); Hiders will only see the tab bar's own window, so the Reels viewer lock " +
+                    "will not run when the viewer opens in another activity",
+            )
             return@apply
         }
 
-        // Fallback: a framework override on a named class.
-        val mainActivity = firstImmutableClassDefOrNull(MAIN_ACTIVITY)
+        val method = firstMethodOrNull(activityHook)
             ?: throw PatchException(
-                "The tab-bar binder was ambiguous (" +
-                    "${withSessionAccessor.size} discriminated, ${viewGroupFromLookup.size} lookup-fed, " +
-                    "${structural.size} structural: ${structural.joinToString { it.method.definingClass }}" +
-                    ") and $MAIN_ACTIVITY is missing, so there is no fallback either. Re-run the " +
-                    "recon in docs/patches/ui.md: find the class whose <init>($VIEW) stores the " +
-                    "tab_bar ViewGroup and add a discriminator that holds in the new build.",
-            )
-
-        val focusChanged = mainActivity.methods.firstOrNull {
-            it.name == ON_WINDOW_FOCUS_CHANGED &&
-                it.parameterTypes.size == 1 &&
-                it.parameterTypes[0].toString() == "Z" &&
-                it.implementation != null
-        } ?: throw PatchException(
-            "The tab-bar binder was ambiguous (${structural.size} structural candidates: " +
-                structural.joinToString { it.method.definingClass } +
-                ") and $MAIN_ACTIVITY does not override $ON_WINDOW_FOCUS_CHANGED(Z)V. Its methods " +
-                "with a single parameter are: " +
-                mainActivity.methods.filter { it.parameterTypes.size == 1 }
-                    .joinToString { "${it.name}(${it.parameterTypes.joinToString()})" } +
-                ". Pick another framework override that runs after the content view is set and " +
-                "update ON_WINDOW_FOCUS_CHANGED.",
-        )
-
-        val method = firstMethodOrNull(focusChanged)
-            ?: throw PatchException(
-                "Found $MAIN_ACTIVITY->$ON_WINDOW_FOCUS_CHANGED but could not open it for editing.",
+                "Found ${anchor.activityHookDescriptor} but could not open it for editing.",
             )
 
         val registerCount = method.implementation?.registerCount
             ?: throw PatchException(
-                "$MAIN_ACTIVITY->$ON_WINDOW_FOCUS_CHANGED has no implementation to inject into.",
+                "${anchor.activityHookDescriptor} has no implementation to inject into.",
             )
 
         method.addInstructions(
             0,
-            listOf(staticCall(HIDERS_CLASS, INSTALL, ACTIVITY, focusChanged.thisRegister(registerCount))),
+            listOf(staticCall(HIDERS_CLASS, INSTALL, ACTIVITY, activityHook.thisRegister(registerCount))),
         )
 
-        println(
-            "$LOG tab-bar binder not uniquely identified (${structural.size} structural candidates); " +
-                "fell back to $MAIN_ACTIVITY->$ON_WINDOW_FOCUS_CHANGED",
-        )
-        println("$LOG injected $HIDERS_CLASS->$INSTALL($ACTIVITY)V at method start")
+        println("$LOG activity hook: ${anchor.activityHookDescriptor}")
+        println("$LOG injected $HIDERS_CLASS->$INSTALL($ACTIVITY)V at its method start")
     }
 }
 

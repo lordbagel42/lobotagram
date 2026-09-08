@@ -10,8 +10,8 @@ import app.revanced.patcher.patch.PatchException
 import app.revanced.patcher.patch.bytecodePatch
 import com.android.tools.smali.dexlib2.AccessFlags
 import com.android.tools.smali.dexlib2.Opcode
+import com.android.tools.smali.dexlib2.builder.MutableMethodImplementation
 import com.android.tools.smali.dexlib2.builder.instruction.BuilderInstruction3rc
-import com.android.tools.smali.dexlib2.iface.ClassDef
 import com.android.tools.smali.dexlib2.iface.Method
 import com.android.tools.smali.dexlib2.immutable.reference.ImmutableMethodReference
 import dev.lobotagram.patches.shared.EXTENSION
@@ -52,7 +52,7 @@ private const val MAX_ENTRY_POINT_HOOKS = 10
 private const val LOG = "[lobotagram]"
 
 /** A method to hook, and which of its parameters is the source enum. */
-private class EntryPoint(val method: Method, val parameterIndex: Int) {
+internal class EntryPoint(val method: Method, val parameterIndex: Int) {
     val signature =
         "${method.definingClass}->${method.name}(${method.parameterTypes.joinToString(",")})"
 
@@ -98,6 +98,93 @@ private fun staticCall(
     ImmutableMethodReference(target, name, listOf(parameter), "V"),
 )
 
+/** What [locateClipsAnchors] found, so the diagnostics patch can print it. */
+internal class ClipsAnchor(
+    /** Every non-obfuscated enum whose `<clinit>` holds all of [SOURCE_ENUM_STRINGS]. */
+    val sourceEnums: List<String>,
+    /** Every enum in the APK that mentions `clips_tab` at all, for the error message. */
+    val enumsMentioningClipsTab: List<String>,
+    /** The clips-viewer source enum, or null when it was not unique. */
+    val sourceEnum: String?,
+    /** Clips-package methods that take that enum, sorted and unbounded. */
+    val entryPoints: List<EntryPoint>,
+    /** Candidate autoscroll gates; exactly one is expected. */
+    val autoscrollGates: List<Method>,
+    /** Types the autoscroll gate's flag may be read off. */
+    val autoscrollManagerTypes: Set<String>,
+)
+
+/**
+ * Resolves the clips-viewer source enum, its injection sites and the autoscroll
+ * gate without modifying anything. Shared with the diagnostics patch.
+ */
+internal fun BytecodePatchContext.locateClipsAnchors(): ClipsAnchor {
+    val classes = classDefs.toList()
+
+    val sourceEnums = classes.filter { classDef ->
+        classDef.superclass == ENUM &&
+            !classDef.type.startsWith("LX/") &&
+            classDef.methods.any { method ->
+                method.name == "<clinit>" &&
+                    method.stringConstants().containsAll(SOURCE_ENUM_STRINGS)
+            }
+    }.map { it.type }
+
+    val sourceEnum = sourceEnums.singleOrNull()
+
+    val entryPoints = if (sourceEnum == null) {
+        emptyList()
+    } else {
+        classes
+            .filter { classDef -> CLIPS_PACKAGES.any { classDef.type.startsWith(it) } }
+            .flatMap { classDef ->
+                classDef.methods.mapNotNull { method ->
+                    if (method.implementation == null) return@mapNotNull null
+                    val index = method.parameterTypes.indexOfFirst { it.toString() == sourceEnum }
+                    if (index < 0) null else EntryPoint(method, index)
+                }
+            }
+            // Deterministic order, so the same APK always gets the same hooks.
+            .sortedBy { it.signature }
+    }
+
+    val autoscrollClasses = classes.filter { it.type.startsWith(AUTOSCROLL_PACKAGE) }
+    // The manager type is what the lifecycle callbacks are constructed with.
+    val autoscrollManagerTypes = autoscrollClasses.flatMap { classDef ->
+        classDef.methods.filter { it.name == "<init>" }
+            .flatMap { it.parameterTypes.map(CharSequence::toString) }
+    }.toSet() + autoscrollClasses.map { it.type }
+
+    val autoscrollGates = if (autoscrollClasses.isEmpty()) {
+        emptyList()
+    } else {
+        classes.flatMap { classDef ->
+            classDef.methods.filter { method ->
+                method.returnType == "Z" &&
+                    method.parameterTypes.size == 1 &&
+                    method.parameterTypes[0].toString() == USER_SESSION &&
+                    method.implementation != null &&
+                    (method.instructionsOrNull ?: emptyList()).any { instruction ->
+                        instruction.opcode == Opcode.IGET_BOOLEAN &&
+                            instruction.fieldReference?.definingClass
+                                ?.let { it in autoscrollManagerTypes } == true
+                    }
+            }
+        }
+    }
+
+    return ClipsAnchor(
+        sourceEnums = sourceEnums,
+        enumsMentioningClipsTab = classes.filter { it.superclass == ENUM }
+            .filter { cd -> cd.methods.any { "clips_tab" in it.stringConstants() } }
+            .map { it.type },
+        sourceEnum = sourceEnum,
+        entryPoints = entryPoints,
+        autoscrollGates = autoscrollGates,
+        autoscrollManagerTypes = autoscrollManagerTypes,
+    )
+}
+
 /**
  * Locks the Reels viewer to the single reel it opened on (P3 of
  * `docs/04-patch-plan.md`).
@@ -135,40 +222,19 @@ val clipsViewerPatch = bytecodePatch(
     dependsOn(tabBarPatch)
 
     apply {
-        val classes = classDefs.toList()
+        val anchor = locateClipsAnchors()
 
         // --- (b) entry-point tracking -------------------------------------
-        val sourceEnums = classes.filter { classDef ->
-            classDef.superclass == ENUM &&
-                !classDef.type.startsWith("LX/") &&
-                classDef.methods.any { method ->
-                    method.name == "<clinit>" &&
-                        method.stringConstants().containsAll(SOURCE_ENUM_STRINGS)
-                }
-        }
-
-        val sourceEnum = sourceEnums.singleOrNull()?.type ?: throw PatchException(
+        val sourceEnum = anchor.sourceEnum ?: throw PatchException(
             "Expected exactly one non-obfuscated enum whose <clinit> holds " +
                 SOURCE_ENUM_STRINGS.joinToString(" and ") { "\"$it\"" } +
-                ", found ${sourceEnums.size}: ${sourceEnums.joinToString { it.type }}. " +
+                ", found ${anchor.sourceEnums.size}: ${anchor.sourceEnums.joinToString()}. " +
                 "Every enum holding \"clips_tab\" in this APK is: " +
-                classes.filter { it.superclass == ENUM }
-                    .filter { cd -> cd.methods.any { "clips_tab" in it.stringConstants() } }
-                    .joinToString { it.type } +
+                anchor.enumsMentioningClipsTab.joinToString() +
                 ". Pick the clips-viewer source enum and update SOURCE_ENUM_STRINGS.",
         )
 
-        val entryPoints = classes
-            .filter { classDef -> CLIPS_PACKAGES.any { classDef.type.startsWith(it) } }
-            .flatMap { classDef ->
-                classDef.methods.mapNotNull { method ->
-                    if (method.implementation == null) return@mapNotNull null
-                    val index = method.parameterTypes.indexOfFirst { it.toString() == sourceEnum }
-                    if (index < 0) null else EntryPoint(method, index)
-                }
-            }
-            // Deterministic order, so the same APK always gets the same hooks.
-            .sortedBy { it.signature }
+        val entryPoints = anchor.entryPoints
 
         if (entryPoints.isEmpty()) {
             throw PatchException(
@@ -209,7 +275,7 @@ val clipsViewerPatch = bytecodePatch(
         }
 
         // --- (c) autoscroll ------------------------------------------------
-        neutralizeAutoscroll(classes)
+        neutralizeAutoscroll(anchor)
     }
 }
 
@@ -229,9 +295,8 @@ val clipsViewerPatch = bytecodePatch(
  * viewer moving whether or not this lands, and the network gate denies the
  * next reel regardless, so a drifted anchor here should not cost a build.
  */
-private fun BytecodePatchContext.neutralizeAutoscroll(classes: List<ClassDef>) {
-    val autoscrollClasses = classes.filter { it.type.startsWith(AUTOSCROLL_PACKAGE) }
-    if (autoscrollClasses.isEmpty()) {
+private fun BytecodePatchContext.neutralizeAutoscroll(anchor: ClipsAnchor) {
+    if (anchor.autoscrollManagerTypes.isEmpty()) {
         println(
             "$LOG no classes under $AUTOSCROLL_PACKAGE; skipping the autoscroll gate. " +
                 "The pager lock still stops the viewer advancing.",
@@ -239,31 +304,13 @@ private fun BytecodePatchContext.neutralizeAutoscroll(classes: List<ClassDef>) {
         return
     }
 
-    // The manager type is what the lifecycle callbacks are constructed with.
-    val managerTypes = autoscrollClasses.flatMap { classDef ->
-        classDef.methods.filter { it.name == "<init>" }
-            .flatMap { it.parameterTypes.map(CharSequence::toString) }
-    }.toSet() + autoscrollClasses.map { it.type }
-
-    val gates = classes.flatMap { classDef ->
-        classDef.methods.filter { method ->
-            method.returnType == "Z" &&
-                method.parameterTypes.size == 1 &&
-                method.parameterTypes[0].toString() == USER_SESSION &&
-                method.implementation != null &&
-                (method.instructionsOrNull ?: emptyList()).any { instruction ->
-                    instruction.opcode == Opcode.IGET_BOOLEAN &&
-                        instruction.fieldReference?.definingClass?.let { it in managerTypes } == true
-                }
-        }
-    }
-
-    val gate = gates.singleOrNull()
+    val gate = anchor.autoscrollGates.singleOrNull()
     if (gate == null) {
         println(
             "$LOG expected exactly one ($USER_SESSION)Z method reading the autoscroll flag on " +
-                "${managerTypes.joinToString()}, found ${gates.size}: " +
-                gates.joinToString { "${it.definingClass}->${it.name}" } +
+                "${anchor.autoscrollManagerTypes.joinToString()}, found " +
+                "${anchor.autoscrollGates.size}: " +
+                anchor.autoscrollGates.joinToString { "${it.definingClass}->${it.name}" } +
                 ". Skipping the autoscroll gate; the pager lock still stops the viewer advancing.",
         )
         return
@@ -276,21 +323,13 @@ private fun BytecodePatchContext.neutralizeAutoscroll(classes: List<ClassDef>) {
         return
     }
 
-    if (registerCount - gate.inputRegisters() < 1) {
-        println(
-            "$LOG ${gate.definingClass}->${gate.name} has no free local register " +
-                "($registerCount registers, ${gate.inputRegisters()} of them inputs); autoscroll gate skipped",
-        )
-        return
-    }
-
-    method.addInstructions(
-        0,
-        """
-            const/4 v0, 0x0
-            return v0
-        """,
-    )
+    // A fresh implementation rather than a prepended return: the old body may
+    // have try blocks, and leaving them behind a dead `return` keeps handlers
+    // pointing at code that can no longer run. The register count is kept, so
+    // it never drops below the parameter count, and v0 is safe to clobber
+    // because nothing after the return is reachable.
+    method.implementation = MutableMethodImplementation(maxOf(1, registerCount))
+    method.addInstructions(0, "const/4 v0, 0x0\nreturn v0")
 
     println("$LOG autoscroll gate ${gate.definingClass}->${gate.name}($USER_SESSION)Z now returns false")
 }

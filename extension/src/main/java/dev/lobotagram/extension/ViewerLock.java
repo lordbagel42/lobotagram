@@ -8,6 +8,7 @@ import android.view.ViewGroup;
 import android.view.ViewParent;
 import android.view.ViewTreeObserver;
 
+import java.lang.ref.WeakReference;
 import java.lang.reflect.Method;
 import java.util.Map;
 import java.util.WeakHashMap;
@@ -62,7 +63,15 @@ public final class ViewerLock {
     /** ViewPager2 / RecyclerView idle scroll state. */
     private static final int STATE_IDLE = 0;
 
-    /** One lock per pager view, dropped with the view. */
+    /**
+     * One lock per pager view, dropped with the view.
+     *
+     * <p>The {@link Lock} holds its pager through a {@link WeakReference} on
+     * purpose: a value that strongly referenced its own key would pin the entry
+     * — and with it the pager, its window and its Activity — for the life of
+     * the process, which is the classic way to leak an Activity out of a
+     * {@link WeakHashMap}.
+     */
     private static final Map<View, Lock> LOCKS = new WeakHashMap<View, Lock>();
 
     private ViewerLock() {
@@ -151,7 +160,8 @@ public final class ViewerLock {
 
     /** Everything applied to one pager view. */
     private static final class Lock implements ViewTreeObserver.OnScrollChangedListener {
-        private final View pager;
+        private final WeakReference<View> pagerRef;
+        private final String pagerClassName;
         private final Method setUserInputEnabled;
         private final Method getScrollState;
         private final Method getCurrentItem;
@@ -163,15 +173,21 @@ public final class ViewerLock {
         private boolean loggedRepin;
 
         Lock(View pager) {
-            this.pager = pager;
+            this.pagerRef = new WeakReference<View>(pager);
+            this.pagerClassName = pager.getClass().getName();
             this.setUserInputEnabled = methodOrNull(pager, "setUserInputEnabled", boolean.class);
             this.getScrollState = methodOrNull(pager, "getScrollState");
             this.getCurrentItem = methodOrNull(pager, "getCurrentItem");
             this.setCurrentItem = methodOrNull(pager, "setCurrentItem", int.class);
         }
 
+        /** The pager, or null once it has been collected. */
+        private View pager() {
+            return pagerRef.get();
+        }
+
         void install() {
-            Lobo.d("locking reels pager " + pager.getClass().getName()
+            Lobo.d("locking reels pager " + pagerClassName
                     + " (userInputEnabled=" + (setUserInputEnabled != null)
                     + ", currentItem=" + (getCurrentItem != null && setCurrentItem != null)
                     + ", source=" + ReelContext.source() + ")");
@@ -185,11 +201,15 @@ public final class ViewerLock {
             Lobo.i("reels pager has no setUserInputEnabled; falling back to a touch"
                     + " swallower and a page watchdog");
 
+            View pager = pager();
+            if (pager == null) {
+                return;
+            }
             ViewTreeObserver observer = pager.getViewTreeObserver();
             if (observer != null) {
                 observer.addOnScrollChangedListener(this);
             }
-            installTouchSwallower();
+            installTouchSwallower(pager);
         }
 
         /**
@@ -197,6 +217,10 @@ public final class ViewerLock {
          * it rebinds the viewer, so setting it once would not hold.
          */
         void enforce() {
+            View pager = pager();
+            if (pager == null) {
+                return;
+            }
             if (setUserInputEnabled != null) {
                 try {
                     setUserInputEnabled.invoke(pager, Boolean.FALSE);
@@ -226,7 +250,8 @@ public final class ViewerLock {
         @Override
         public void onScrollChanged() {
             try {
-                if (setCurrentItem == null || pinned < 0) {
+                final View pager = pager();
+                if (pager == null || setCurrentItem == null || pinned < 0) {
                     return;
                 }
                 if (scrollState() != STATE_IDLE) {
@@ -262,7 +287,7 @@ public final class ViewerLock {
          * pager has no input switch, because it replaces whatever touch
          * listener the pager already had.
          */
-        private void installTouchSwallower() {
+        private void installTouchSwallower(final View pager) {
             try {
                 final int slop = ViewConfiguration.get(pager.getContext()).getScaledTouchSlop();
                 pager.setOnTouchListener(new View.OnTouchListener() {
@@ -301,7 +326,8 @@ public final class ViewerLock {
         }
 
         private int currentItem() {
-            if (getCurrentItem == null) {
+            View pager = pager();
+            if (pager == null || getCurrentItem == null) {
                 return -1;
             }
             try {
@@ -313,7 +339,8 @@ public final class ViewerLock {
         }
 
         private int scrollState() {
-            if (getScrollState == null) {
+            View pager = pager();
+            if (pager == null || getScrollState == null) {
                 return STATE_IDLE;
             }
             try {

@@ -47,20 +47,44 @@ The most specific level with exactly one candidate wins.
 you confirm by eye that the right ViewGroup was captured — but the id is never
 hardcoded in the patch.
 
-Fallback — `Lcom/instagram/mainactivity/InstagramMainActivity;` ->
-`onWindowFocusChanged(Z)V`. A framework override on a named class, so it cannot
-be renamed. `Hiders.install(Landroid/app/Activity;)V` is injected at method
-start and walks the window from the decor view instead.
+Activity hook — the first of these that exists with a body, injected at method
+start, all framework method names on named classes:
+
+1. `Lcom/instagram/base/activity/BaseFragmentActivity;->onAttachedToWindow()V`
+   (the winner here)
+2. `Lcom/instagram/base/activity/IgFragmentActivity;->onWindowFocusChanged(Z)V`
+3. `Lcom/instagram/mainactivity/InstagramMainActivity;->onWindowFocusChanged(Z)V`
+
+`Hiders.install(Landroid/app/Activity;)V` walks the window from the decor view.
+This is **not merely a fallback for the binder — it is installed whenever it
+resolves**, because a `ViewTreeObserver` only ever fires for its own window:
+
+- `BaseFragmentActivity` is the superclass of `InstagramMainActivity`, of
+  `Lcom/instagram/modal/ModalActivity;` (which hosts most non-tab fragments)
+  and of `Lcom/instagram/urlhandler/MainSessionUrlHandlerActivity;` (which is
+  where a reel shared into a DM deep-links to). Hooking it once reaches every
+  window that can show a reel.
+- The tab bar does not exist in those other windows, so a listener installed on
+  it cannot see a Reels viewer that opened in one of them — `ViewerLock` and the
+  Friends-lane hider would never run. That is the whole "watch one, scroll none"
+  guarantee, so it does not get to depend on which activity the viewer landed
+  in.
+- `Hiders` is idempotent per root view (a `WeakHashMap`-backed identity set), so
+  the two hooks overlapping in the main activity's window is a no-op for the
+  second one.
 
 Note that `InstagramMainActivity` has **no** `onCreate(Landroid/os/Bundle;)V`
 of its own in this build (`docs/04-patch-plan.md` assumed it did): the cold
 start runs through `BaseFragmentActivity` and obfuscated `A1r`/`A1s` overrides.
-`onWindowFocusChanged` was chosen because it is a framework name, it runs after
-the content view exists, and firing repeatedly is harmless — the runtime side
-is idempotent.
+`onAttachedToWindow` was chosen because it is a framework name on the shared
+base class, it runs once per window with the decor view already built, and
+firing repeatedly is harmless — the runtime side is idempotent.
 
-If neither hook can be identified the patch throws a `PatchException` listing
-the candidate count at each level and every structural candidate's class.
+Only if *neither* the binder nor an activity hook can be identified does the
+patch throw a `PatchException`, listing the candidate count at each level, every
+structural candidate's class, and every activity hook it tried. A resolved
+binder with no activity hook still hides the tab, and prints a line saying the
+viewer lock will not run in windows without a tab bar.
 
 ### "Lock Reels viewer"
 
@@ -80,6 +104,9 @@ Entry-point tracking, all name- and string-anchored:
 - Sites are sorted lexicographically and capped at 10, so a future build that
   threads the enum through many clips methods gets a deterministic, bounded set
   rather than dozens of injections. No site at all is a `PatchException`.
+- The scan lives in `locateClipsAnchors()`, which the "Lobotagram diagnostics"
+  patch calls to print the enum, the sites and the autoscroll gate without
+  modifying anything. `locateTabBarHooks()` does the same for the tab bar.
 
 Autoscroll (best effort, never fatal):
 
@@ -92,8 +119,11 @@ Autoscroll (best effort, never fatal):
   `Lcom/instagram/common/session/UserSession;` parameter that reads a boolean
   field off that manager: `LX/403;->A01(UserSession)Z` in this build, read
   right next to `Lcom/instagram/feed/media/mediaoption/MediaOption$Option;->AUTO_SCROLL`
-  when the viewer's overflow menu is built. It is rewritten to
-  `const/4 v0, 0x0; return v0`.
+  when the viewer's overflow menu is built.
+- Its body is *replaced* (`const/4 v0, 0x0; return v0` on a fresh
+  `MutableMethodImplementation` that keeps the register count), rather than
+  having a return prepended: a prepended return would leave the old try/catch
+  ranges pointing at code that can no longer run.
 - If that chain does not resolve uniquely the patch prints why and carries on.
   Failing a build over an optional third layer would be the wrong trade: the
   pager lock already stops the viewer moving and the network gate already
@@ -102,8 +132,9 @@ Autoscroll (best effort, never fatal):
 ## Why the work is at runtime
 
 The patches inject one call each. Everything else happens in the extension, off
-a single `ViewTreeObserver.OnGlobalLayoutListener` installed on the tab bar (or
-the decor view, in the fallback wiring).
+`ViewTreeObserver.OnGlobalLayoutListener`s — one on the tab bar, one on each
+activity window's decor view, because an observer only fires for its own
+window.
 
 That split is deliberate:
 
@@ -124,6 +155,10 @@ That split is deliberate:
 `Hiders` (per layout pass, cheap: two `findViewById` calls)
 
 - Sets `clips_tab` to `View.GONE`.
+- Resolves every resource name through a process-wide `name -> id` cache. Ids do
+  not change while the process lives, and `Resources.getIdentifier` is a name
+  lookup in the resource table that would otherwise run two to five times per
+  layout pass per window.
 - Hides every child after the first inside
   `clips_viewer_action_bar` → `action_bar_tab_layout` — the "Friends"/"Blend"
   lane, i.e. a lateral route from a DM-opened reel into another endless feed.
@@ -190,6 +225,12 @@ tab" toggle needs no new anchor.
 - **The touch swallower replaces any existing touch listener** on the pager. It
   is only installed when there is no `setUserInputEnabled`, i.e. never on this
   build.
+- **The swipe skipper feeds a tab-bar child index to `setCurrentItem`.** It
+  reasons in tab views rather than page indices everywhere else, but the jump
+  itself assumes the pager and the bar agree on an order. When they do not, the
+  re-aim misses and `verify()` falls back to clicking the destination tab once
+  the pager settles, which always lands on the right surface but looks like two
+  motions instead of one.
 - **The watchdog pins to the page the viewer opened on**, not to page 0. That
   is right for a chain whose tapped reel is not first, but if a build changes
   page programmatically *after* the lock captured the index, the watchdog would
@@ -215,10 +256,14 @@ adb logcat -s Lobotagram
 A healthy cold start prints, roughly in order:
 
 ```
+hiders installed on com.android.internal.policy.DecorView
 hiders installed on <tab bar class>
 hid clips_tab
 swipe skipper attached to androidx.viewpager2.widget.ViewPager2
 ```
+
+(one "hiders installed" line per window, so opening a modal screen adds
+another)
 
 and opening a reel from a DM adds:
 
@@ -234,7 +279,8 @@ Then, by symptom:
 
 | Symptom | Where to look |
 |---|---|
-| Patching fails on "Hide Reels tab" | The `PatchException` lists the candidate count per level and every structural candidate. Re-run the candidate scan below and add a discriminator that holds in the new build; or delete the discriminator and lean on the `InstagramMainActivity` fallback. |
+| Patching fails on "Hide Reels tab" | Only happens when *both* hooks are gone. The `PatchException` lists the candidate count per level, every structural candidate, and every activity hook tried. Re-run the candidate scan below and add a discriminator that holds in the new build, or point `ACTIVITY_HOOKS` at another framework override that runs after the content view is set. |
+| "no activity hook resolved" printed | The tab still gets hidden, but the Reels viewer lock will not run in windows that have no tab bar. Fix `ACTIVITY_HOOKS` before shipping the build. |
 | Patching fails on "Lock Reels viewer", enum not found | The message lists every enum in the APK holding `clips_tab`. Pick the clips-viewer source enum and update `SOURCE_ENUM_STRINGS`. |
 | Patching fails on "Lock Reels viewer", no injection site | The source enum moved out of `com.instagram.clips` / `instagram.features.clips`. Widen `CLIPS_PACKAGES`. |
 | "autoscroll gate skipped" printed | Expected drift, not a failure. The chain starts at `AUTOSCROLL_PACKAGE`; check that package still exists and still holds the lifecycle-callback class. |
@@ -262,8 +308,11 @@ java -Xmx6g -cp tools/revanced-cli-6.0.0-all.jar Scan.java instagram-<version>.a
 
 What to check, in the order the patches need it:
 
-1. `Lcom/instagram/mainactivity/InstagramMainActivity;` exists and still
-   overrides `onWindowFocusChanged(Z)V`.
+1. `Lcom/instagram/base/activity/BaseFragmentActivity;` exists, still overrides
+   `onAttachedToWindow()V`, and is still the superclass of
+   `InstagramMainActivity`, `ModalActivity` and the URL-handler activities
+   (`IgFragmentActivity->onWindowFocusChanged(Z)V` and
+   `InstagramMainActivity->onWindowFocusChanged(Z)V` are the next choices).
 2. Exactly one non-`LX/` enum's `<clinit>` holds `clips_tab` and `direct`.
 3. Exactly one method under the clips packages takes that enum.
 4. `Linstagram/features/clips/viewer/controller/autoscroll/` still exists.
