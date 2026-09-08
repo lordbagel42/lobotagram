@@ -1,0 +1,24 @@
+# Build outputs
+build/
+*/build/
+.gradle/
+out/
+*.class
+
+# Local toolchain and inputs (never commit)
+tools/*.jar
+tools/jadx*/
+*.apk
+*.apkm
+*.xapk
+*.apks
+*.keystore
+*.jks
+local.properties
+.env
+env.sh
+
+# IDE
+.idea/
+*.iml
+.vscode/
