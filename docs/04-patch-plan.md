@@ -58,6 +58,12 @@ temptation.
 
 ## 3. Patches
 
+> The sketches below are the original plan. The implemented rules and anchors
+> live in [patches/network.md](patches/network.md) and [patches/ui.md](patches/ui.md),
+> which are normative where they differ (for example `/clips/connected/` is
+> blocked outright, the source enum is the named `ClipsViewerSource`, and the
+> UI hooks install from `BaseFragmentActivity.onAttachedToWindow`).
+
 ### P1. Network gate (primary)
 
 Fingerprint (named, stable across every version anyone has tested):
