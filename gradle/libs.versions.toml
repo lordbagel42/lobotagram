@@ -1,0 +1,11 @@
+[versions]
+# Matches the Kotlin standard library bundled in ReVanced CLI 6.0.0 (2.3.10).
+kotlin = "2.3.10"
+# R8 ships D8, used to compile the extension and the patches to DEX.
+r8 = "9.4.17"
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+
+[libraries]
+r8 = { module = "com.android.tools:r8", version.ref = "r8" }

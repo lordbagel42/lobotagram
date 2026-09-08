@@ -2,8 +2,12 @@
 build/
 */build/
 .gradle/
+.kotlin/
 out/
 *.class
+
+# The Gradle wrapper jar is the one jar that is committed on purpose; the
+# tools/*.jar rule below keeps the downloaded toolchain out.
 
 # Local toolchain and inputs (never commit)
 tools/*.jar

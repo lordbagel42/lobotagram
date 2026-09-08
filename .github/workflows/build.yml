@@ -1,0 +1,83 @@
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      # The extension is compiled against the Android platform jar. Runner
+      # images ship the SDK; make sure a platform is actually installed.
+      - name: Ensure an Android platform is installed
+        run: |
+          set -eu
+          if ! ls "$ANDROID_HOME"/platforms/*/android.jar > /dev/null 2>&1; then
+            "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --install "platforms;android-35"
+          fi
+          ls "$ANDROID_HOME"/platforms
+
+      # ReVanced CLI is the compile classpath for the patches; :patches:fetchCli
+      # downloads it into tools/ and verifies its checksum.
+      - name: Build the patch bundle
+        run: ./gradlew build --stacktrace
+
+      - name: Show the bundle contents
+        run: |
+          unzip -l build/lobotagram.rvp
+          unzip -p build/lobotagram.rvp META-INF/MANIFEST.MF
+
+      - name: List the patches
+        run: java -jar tools/revanced-cli-6.0.0-all.jar list-patches -b -p build/lobotagram.rvp --packages --versions --options
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lobotagram-rvp
+          path: build/lobotagram*.rvp
+          if-no-files-found: error
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: lobotagram-rvp
+          path: dist
+
+      # The versioned rvp is the file to point ReVanced Manager at, via
+      # Settings -> patch sources -> add patches from a URL.
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$TAG" \
+            --generate-notes \
+            dist/lobotagram*.rvp
