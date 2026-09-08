@@ -7,11 +7,15 @@ lobotagram/
 ├── extension/                        # plain Java, compiled to one DEX (lobotagram.rve)
 │   └── src/main/java/dev/lobotagram/extension/
 │       ├── Lobo.java                 # logging, runtime trace switch
-│       └── Hello.java                # smoke test the diagnostics patch looks for
+│       ├── Gate.java                 # URI decision table (throwIfBlocked)
+│       └── FeedFilter.java           # feed-unit type token filter
 ├── patches/                          # Kotlin, the patches themselves
 │   └── src/main/kotlin/dev/lobotagram/patches/
 │       ├── shared/Constants.kt       # package name, extension paths, pinned versions
-│       └── HelloPatch.kt             # "Lobotagram diagnostics", off by default
+│       ├── network/NetworkGatePatch.kt    # P1: TigonServiceLayer.startRequest hook
+│       ├── signature/SignatureBypassPatch.kt  # P4: key-hash checks return true
+│       ├── feed/FeedItemFilterPatch.kt    # P5: drop the suggested-reels feed unit
+│       └── DiagnosticsPatch.kt       # "Lobotagram diagnostics", off by default
 ├── scripts/patch.sh                  # merge splits, build the rvp, patch, sign, install
 ├── tools/                            # downloaded jars (git-ignored)
 └── build/lobotagram.rvp              # the patch bundle
