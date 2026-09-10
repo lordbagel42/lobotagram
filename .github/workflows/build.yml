@@ -148,12 +148,20 @@ jobs:
             fi
           done
 
-          # shellcheck disable=SC2086
-          gh release create "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --title "$TAG" \
-            --generate-notes \
-            $assets
+          # Re-runnable: a retagged or re-run release replaces its assets
+          # instead of failing on "release already exists".
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            echo "Release $TAG already exists; replacing its assets."
+            # shellcheck disable=SC2086
+            gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber $assets
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes \
+              $assets
+          fi
 
       - name: Publish patches.json for ReVanced Manager
         run: |
@@ -186,6 +194,6 @@ jobs:
           print('patches.json is well formed')
           "
 
-          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" patches.json
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber patches.json
 
           echo "Paste this into ReVanced Manager: $RELEASE_BASE/patches.json"
