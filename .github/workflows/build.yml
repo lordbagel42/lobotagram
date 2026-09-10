@@ -7,6 +7,7 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Read-only by default. Only the release job widens this.
 permissions:
   contents: read
 
@@ -55,6 +56,11 @@ jobs:
           path: build/lobotagram*.rvp
           if-no-files-found: error
 
+  # Publishes a release whose assets are what ReVanced Manager needs:
+  #   patches.json      the ReVancedAsset JSON its "Enter URL" flow parses
+  #   lobotagram.rvp    stable asset name, so download_url never changes
+  # Both are reachable at releases/latest/download/<name>.
+  # See docs/06-revanced-manager-source.md.
   release:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: build
@@ -63,21 +69,123 @@ jobs:
     permissions:
       contents: write
 
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TAG: ${{ github.ref_name }}
+      RELEASE_BASE: https://github.com/${{ github.repository }}/releases/latest/download
+
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           name: lobotagram-rvp
           path: dist
 
-      # The versioned rvp is the file to point ReVanced Manager at, via
-      # Settings -> patch sources -> add patches from a URL.
-      - name: Create the release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ github.ref_name }}
+      # The version Manager displays comes from the rvp manifest, the version
+      # it compares for updates comes from patches.json, and both are derived
+      # from gradle.properties. If the tag disagrees with either, stop: a
+      # release that ships a manifest version other than its tag is a trap.
+      - name: Check the tag against the bundle version
         run: |
+          set -eu
+          expected="${TAG#v}"
+
+          gradle_version="$(sed -n 's/^[[:space:]]*version[[:space:]]*=[[:space:]]*//p' gradle.properties | head -1)"
+          if [ "$gradle_version" != "$expected" ]; then
+            echo "::error::Tag $TAG implies version $expected but gradle.properties says '$gradle_version'." \
+                 "Bump gradle.properties, or retag."
+            exit 1
+          fi
+
+          test -f dist/lobotagram.rvp || { echo "::error::dist/lobotagram.rvp is missing"; exit 1; }
+
+          manifest_version="$(unzip -p dist/lobotagram.rvp META-INF/MANIFEST.MF \
+            | tr -d '\r' | sed -n 's/^Version:[[:space:]]*//p' | head -1)"
+          if [ "$manifest_version" != "$expected" ]; then
+            echo "::error::The rvp manifest says Version '$manifest_version', expected '$expected' from tag $TAG."
+            exit 1
+          fi
+
+          echo "Tag $TAG, gradle.properties $gradle_version, rvp manifest $manifest_version."
+          ls -l dist
+
+      # Optional. Manager parses signature_download_url and never reads it, so
+      # an unsigned bundle is added with no warning; this exists so the field
+      # is filled in when the repository has the secrets to fill it.
+      - name: Sign the bundle
+        id: sign
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+        run: |
+          set -eu
+          if [ -z "${GPG_PRIVATE_KEY:-}" ]; then
+            echo "No GPG_PRIVATE_KEY secret set; publishing unsigned." \
+                 "ReVanced Manager does not verify bundle signatures, so this is not an error."
+            echo "signed=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          printf '%s\n' "$GPG_PRIVATE_KEY" | gpg --batch --quiet --import
+          gpg --batch --yes --pinentry-mode loopback \
+              --passphrase "${GPG_PASSPHRASE:-}" \
+              --armor --detach-sign \
+              --output dist/lobotagram.rvp.asc \
+              dist/lobotagram.rvp
+          gpg --verify dist/lobotagram.rvp.asc dist/lobotagram.rvp
+          echo "signed=true" >> "$GITHUB_OUTPUT"
+
+      # Created first, with the rvp assets, so its generated notes can become
+      # the description field of patches.json.
+      - name: Create the release
+        run: |
+          set -eu
+          assets="dist/lobotagram.rvp"
+          for extra in dist/lobotagram-*.rvp dist/lobotagram.rvp.asc; do
+            if [ -f "$extra" ]; then
+              assets="$assets $extra"
+            fi
+          done
+
+          # shellcheck disable=SC2086
           gh release create "$TAG" \
             --repo "$GITHUB_REPOSITORY" \
             --title "$TAG" \
             --generate-notes \
-            dist/lobotagram*.rvp
+            $assets
+
+      - name: Publish patches.json for ReVanced Manager
+        run: |
+          set -eu
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json body -q .body > notes.md
+          created_at="$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json createdAt -q .createdAt)"
+
+          signature_url=""
+          if [ "${{ steps.sign.outputs.signed }}" = "true" ]; then
+            signature_url="$RELEASE_BASE/lobotagram.rvp.asc"
+          fi
+
+          ./scripts/release-json.sh \
+            "$TAG" \
+            "$created_at" \
+            notes.md \
+            "$RELEASE_BASE/lobotagram.rvp" \
+            "$signature_url" > patches.json
+
+          cat patches.json
+          # Manager refuses a source whose JSON does not deserialize, so fail
+          # here rather than shipping a release nobody can add.
+          python3 -c "
+          import json, sys, datetime
+          d = json.load(open('patches.json'))
+          for k in ('version', 'created_at', 'description', 'download_url'):
+              assert isinstance(d.get(k), str) and d[k], f'{k} must be a non-empty string'
+          # kotlinx.datetime.LocalDateTime: no offset, no trailing Z.
+          datetime.datetime.strptime(d['created_at'], '%Y-%m-%dT%H:%M:%S')
+          print('patches.json is well formed')
+          "
+
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" patches.json
+
+          echo "Paste this into ReVanced Manager: $RELEASE_BASE/patches.json"

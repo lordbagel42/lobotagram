@@ -117,14 +117,38 @@ The property is lost on reboot.
 
 ## Loading the rvp into ReVanced Manager
 
-In Manager: **Settings → patch sources → "Add new patches from a URL or local
-files"**, and give it either the local `lobotagram.rvp` or the URL of the rvp
-attached to a GitHub release (CI attaches it on `v*` tags). The bundle contains
-`classes.dex`, so Manager can load the patches on the phone.
+In Manager: **Settings → patch sources → Add patches**. Two routes:
 
-Manager and CLI both verify bundle signatures by default and we do not sign
-bundles, so the CLI needs `-b` (`--bypass-verification`). In Manager, accept the
-unverified-source prompt.
+- **Enter URL** (a remote source, which auto-updates) wants the URL of a JSON
+  descriptor, not of the rvp:
+  `https://github.com/lordbagel42/lobotagram/releases/latest/download/patches.json`.
+  CI publishes that file on every `v*` tag.
+- **Select from storage** takes a local `lobotagram.rvp` straight from
+  `./gradlew build`.
+
+The bundle contains `classes.dex`, so Manager can load the patches on the phone.
+
+Manager 2.x does not verify bundle signatures — it parses
+`signature_download_url` out of the JSON and never reads it — so there is no
+unverified-source prompt. The CLI is the one that checks, hence `-b`
+(`--bypass-verification`) in every command here.
+[docs/06-revanced-manager-source.md](06-revanced-manager-source.md) has the
+schema, the Manager code that reads it, and how to turn on optional GPG
+signing.
+
+## Releasing
+
+A `v*` tag runs the `release` job in `.github/workflows/build.yml`:
+
+```bash
+# gradle.properties version must already equal the tag without the v,
+# or the release job fails on purpose.
+git tag v0.1.0 && git push origin v0.1.0
+```
+
+It publishes `lobotagram.rvp` (stable asset name), `lobotagram-<version>.rvp`,
+and `patches.json` built by `scripts/release-json.sh` from the generated
+release notes. `contents: write` is scoped to that job alone.
 
 ## Conventions
 

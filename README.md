@@ -17,6 +17,7 @@ yet**: the on-device checklist in the plan is the next step.
 | [docs/03-prior-art.md](docs/03-prior-art.md) | FeurStagram, InstaEclipse, ReVanced's Instagram patch, and an apktool experiment, with the parts we reuse |
 | [docs/04-patch-plan.md](docs/04-patch-plan.md) | The plan: patches P1-P6, build pipeline, verification checklist, risks, order of work |
 | [docs/05-development.md](docs/05-development.md) | Project layout, build and test commands, how the rvp is built without the official ReVanced Gradle plugin, trace mode, loading the rvp into ReVanced Manager |
+| [docs/06-revanced-manager-source.md](docs/06-revanced-manager-source.md) | What ReVanced Manager expects from a remote patch source: the URL it wants, the `ReVancedAsset` JSON schema, why signatures are optional, how it detects updates |
 | [CLAUDE.md](CLAUDE.md) | Commands, module layout and the conventions patches have to follow |
 | [tools/recon.sh](tools/recon.sh) | Script to confirm the patch anchors exist in a given Instagram APK |
 | [scripts/patch.sh](scripts/patch.sh) | Merge split bundles, build the rvp, patch, sign with a persistent keystore, optionally install |
@@ -50,11 +51,30 @@ Two routes. Both need the Instagram APK from APKMirror (arm64-v8a, see
 re-signed, stock Instagram uninstalled first (or a package-rename patch, not
 yet written).
 
-**On the phone with ReVanced Manager.** Take `lobotagram.rvp` from a GitHub
-release of this repo (CI attaches it on `v*` tags) or from `./gradlew build`.
-In ReVanced Manager: Settings → patch sources → "Add new patches from a URL or
-local files", point it at the rvp, accept the unverified-source prompt, then
-patch Instagram with the Lobotagram patches selected.
+**On the phone with ReVanced Manager.** Add lobotagram as a remote patch
+source, so it updates itself. In ReVanced Manager: Settings → patch sources →
+**Add patches** → **Enter URL**, and paste exactly this:
+
+```
+https://github.com/lordbagel42/lobotagram/releases/latest/download/patches.json
+```
+
+Leave **Auto update** checked, tap Add, then patch Instagram with the
+Lobotagram patches selected. That URL is stable: it always resolves to the
+newest release, so it never has to be changed.
+
+Manager wants the URL of that little JSON file, **not** of the `.rvp` — the
+JSON is what tells it where the bundle is and when it has changed. Pointing it
+straight at `lobotagram.rvp` gets you "This URL is pointing to an unsupported
+source." Manager does not verify bundle signatures, so there is no
+unverified-source prompt and nothing to accept; see
+[docs/06-revanced-manager-source.md](docs/06-revanced-manager-source.md) for
+the schema and the Manager code that reads it.
+
+To load one build without adding a source, pick **Select from storage**
+instead and hand it a `lobotagram.rvp` from
+[the releases page](https://github.com/lordbagel42/lobotagram/releases/latest)
+or from `./gradlew build`.
 
 **On a computer with the CLI.**
 
@@ -101,7 +121,7 @@ endpoints untouched.
 - [x] Patches: network gate, signature bypass, feed filter, Reels tab hider + swipe skipper, viewer lock + source hook, diagnostics
 - [x] Code review pass (gate rule audit against every `clips/*` endpoint in the APK, leak and crash-safety fixes)
 - [ ] Run on a device: trace-mode endpoint capture, then the section 6 checklist
-- [ ] Tag `v0.1.0` so CI publishes the rvp for ReVanced Manager
+- [x] Tag `v0.1.0` so CI publishes the rvp and `patches.json` for ReVanced Manager
 - [ ] Optional: package-rename ("Clone") patch to install next to stock Instagram
 
 ## License
